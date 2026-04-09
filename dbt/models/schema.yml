@@ -1,0 +1,68 @@
+version: 2
+
+models:
+  - name: stg_reviews
+    description: "Cleaned staging view over raw ingested reviews from Shopee and Lazada."
+    columns:
+      - name: platform
+        description: "Source platform: shopee or lazada"
+        tests:
+          - not_null
+          - accepted_values:
+              values: ["shopee", "lazada"]
+      - name: rating
+        tests:
+          - not_null
+          - accepted_values:
+              values: [1, 2, 3, 4, 5]
+      - name: sentiment_label
+        tests:
+          - accepted_values:
+              values: ["positive", "negative", "neutral"]
+      - name: comment
+        tests:
+          - not_null
+
+  - name: dim_product
+    description: "Product dimension — one row per (item_id, platform)."
+    columns:
+      - name: product_key
+        tests:
+          - unique
+          - not_null
+      - name: item_id
+        tests:
+          - not_null
+      - name: platform
+        tests:
+          - not_null
+
+  - name: fact_reviews
+    description: "Core fact table — one row per review."
+    columns:
+      - name: review_key
+        tests:
+          - unique
+          - not_null
+      - name: product_key
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_product')
+              field: product_key
+
+  - name: mart_daily_sentiment
+    description: "Daily aggregated sentiment per product and platform for Metabase."
+    columns:
+      - name: report_date
+        tests:
+          - not_null
+      - name: platform
+        tests:
+          - not_null
+
+  - name: mart_product_summary
+    description: "Single-row-per-product summary metrics."
+
+  - name: mart_rating_distribution
+    description: "Rating distribution per product and platform."

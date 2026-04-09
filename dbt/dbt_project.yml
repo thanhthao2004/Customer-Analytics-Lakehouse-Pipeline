@@ -1,0 +1,29 @@
+name: 'customer_analytics'
+version: '1.0.0'
+config-version: 2
+
+profile: 'customer_analytics'
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  customer_analytics:
+    staging:
+      schema: staging
+      materialized: view
+    warehouse:
+      schema: warehouse
+      materialized: table
+    marts:
+      schema: metabase
+      materialized: table

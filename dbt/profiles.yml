@@ -1,0 +1,13 @@
+customer_analytics:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('POSTGRES_HOST', 'localhost') }}"
+      port: "{{ env_var('POSTGRES_PORT', '5432') | int }}"
+      user: "{{ env_var('POSTGRES_USER', 'analytics') }}"
+      password: "{{ env_var('POSTGRES_PASSWORD', 'analytics123') }}"
+      dbname: "{{ env_var('POSTGRES_DB', 'customer_analytics') }}"
+      schema: warehouse
+      threads: 4
+      connect_timeout: 10
