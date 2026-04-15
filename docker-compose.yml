@@ -12,7 +12,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./init_db:/docker-entrypoint-initdb.d
+      - ./infrastructure/init_db:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U analytics -d customer_analytics"]
       interval: 10s
@@ -35,87 +35,4 @@ services:
       postgres:
         condition: service_healthy
 
-# MinIO - Data Lake RAW Layer
-  minio:
-    image: minio/minio
-    container_name: analytics_minio
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    environment:
-      MINIO_ROOT_USER: admin
-      MINIO_ROOT_PASSWORD: adminpassword
-    command: server /data --console-address ":9001"
-    volumes:
-      - minio_data:/data
-
-  minio-init:
-    image: minio/mc
-    container_name: analytics_minio_init
-    depends_on:
-      - minio
-    entrypoint: >
-      /bin/sh -c "
-      sleep 5;
-      /usr/bin/mc config host add myminio http://minio:9000 admin adminpassword;
-      /usr/bin/mc mb myminio/raw-data || true;
-      /usr/bin/mc anonymous set download myminio/raw-data;
-      exit 0;
-      "
-
-# Apache Airflow - Orchestration Layer
-  airflow-webserver:
-    build:
-      context: .
-      dockerfile: Dockerfile.airflow
-    container_name: analytics_airflow_web
-    command: webserver
-    ports:
-      - "8080:8080"
-    environment: &airflow-env
-      AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://analytics:analytics123@postgres/customer_analytics
-      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
-    volumes:
-      - ./dags:/opt/airflow/dags
-      - ./logs:/opt/airflow/logs
-      - .:/opt/app
-    depends_on:
-      postgres:
-        condition: service_healthy
-
-  airflow-scheduler:
-    build:
-      context: .
-      dockerfile: Dockerfile.airflow
-    container_name: analytics_airflow_scheduler
-    command: scheduler
-    environment: *airflow-env
-    volumes:
-      - ./dags:/opt/airflow/dags
-      - ./logs:/opt/airflow/logs
-      - .:/opt/app
-    depends_on:
-      postgres:
-        condition: service_healthy
-
-  airflow-init:
-    build:
-      context: .
-      dockerfile: Dockerfile.airflow
-    container_name: analytics_airflow_init
-    command: version
-    environment:
-      <<: *airflow-env
-      _AIRFLOW_DB_MIGRATE: 'true'
-      _AIRFLOW_WWW_USER_CREATE: 'true'
-      _AIRFLOW_WWW_USER_USERNAME: admin
-      _AIRFLOW_WWW_USER_PASSWORD: adminpassword
-    depends_on:
-      postgres:
-        condition: service_healthy
-
-volumes:
-  postgres_data:
-  minio_data:
+# MinIO - D

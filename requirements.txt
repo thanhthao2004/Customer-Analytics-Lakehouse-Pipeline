@@ -13,4 +13,3 @@ tenacity==8.2.3
 tqdm==4.66.2
 google-genai==1.10.0
 dbt-core==1.7.10
-dbt-postgres==1.7.10

@@ -370,53 +370,49 @@ class ShopeeScraper:
                 logger.debug(f"[Shopee] No reviews visible for '{product_name[:30]}'.")
                 break
 
-            for el in review_els:
-                try:
-                    # rating: count solid stars (those without fill="none")
-                    all_stars = el.find_elements(
-                        By.CSS_SELECTOR,
-                        "svg.shopee-svg-icon"
-                    )
-                    rating = 0
-                    for s in all_stars:
-                        cls = s.get_attribute("class") or ""
-                        if "icon-rating-solid" in cls:
-                            rating += 1
-                        elif "icon-rating" in cls:
-                            # Verify via inner polygon if it has fill="none"
-                            try:
-                                poly = s.find_element(By.TAG_NAME, "polygon")
-                                if poly.get_attribute("fill") != "none":
-                                    rating += 1
-                            except Exception:
-                                pass
-                    # If we accidentally count extra SVGs, cap rating to 5
-                    rating = min(5, rating)
-
-                    # comment
-                    comment = ""
-                    try:
-                        comment = el.find_element(By.CSS_SELECTOR, ".YNedDV").text.strip()
-                    except Exception:
-                        pass
-                    if not comment:
+            # Extract all review data quickly using JavaScript to avoid StaleElementReferenceException
+            try:
+                js_script = """
+                return Array.from(document.querySelectorAll('div[data-cmtid]')).map(el => {
+                    let rating = 0;
+                    el.querySelectorAll('svg.shopee-svg-icon').forEach(s => {
+                        if (s.classList.contains('icon-rating-solid')) rating++;
+                        else if (s.classList.contains('icon-rating')) {
+                            let poly = s.querySelector('polygon');
+                            if (poly && poly.getAttribute('fill') !== 'none') rating++;
+                        }
+                    });
+                    if (rating > 5) rating = 5;
+                    
+                    let comment = '';
+                    let c_el = el.querySelector('.YNedDV');
+                    if (c_el) comment = c_el.innerText.trim();
+                    
+                    let reviewer_name = 'anonymous';
+                    let r_el = el.querySelector('.InK5kS');
+                    if (r_el) reviewer_name = r_el.innerText.trim();
+                    
+                    let ts = '';
+                    let t_el = el.querySelector('.XYk98l');
+                    if (t_el) ts = t_el.innerText.trim();
+                    
+                    return {rating, comment, reviewer_name, ts};
+                });
+                """
+                page_reviews = self.driver.execute_script(js_script)
+                
+                for r_data in page_reviews:
+                    if not r_data.get('comment'):
                         continue
-
-                    # reviewer_name
-                    reviewer_name = "anonymous"
-                    try:
-                        reviewer_name = el.find_element(By.CSS_SELECTOR, ".InK5kS").text.strip()
-                    except Exception:
-                        pass
-
-                    # review_time
+                        
                     review_time_val = datetime.utcnow()
-                    try:
-                        ts = el.find_element(By.CSS_SELECTOR, ".XYk98l").text.strip()
-                        review_time_val = datetime.strptime(ts, "%Y-%m-%d %H:%M")
-                    except Exception:
-                        pass
-
+                    ts = r_data.get('ts')
+                    if ts:
+                        try:
+                            review_time_val = datetime.strptime(ts, "%Y-%m-%d %H:%M")
+                        except Exception:
+                            pass
+                            
                     reviews.append({
                         "platform":      "shopee",
                         "brand":         page_brand,
@@ -428,14 +424,13 @@ class ShopeeScraper:
                         "time_delivery": time_delivery,
                         "price":         price,
                         "flash_sale":    flash_sale,
-                        "rating":        rating,
-                        "comment":       comment,
-                        "reviewer_name": reviewer_name,
+                        "rating":        r_data.get('rating', 0),
+                        "comment":       r_data.get('comment', ''),
+                        "reviewer_name": r_data.get('reviewer_name', 'anonymous'),
                         "review_time":   review_time_val,
                     })
-
-                except Exception as exc:
-                    logger.debug(f"[Shopee] Review parse error: {exc}")
+            except Exception as exc:
+                logger.debug(f"[Shopee] Review JS execution error: {exc}")
 
             # Paginate reviews
             try:

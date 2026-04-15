@@ -86,17 +86,4 @@ CREATE TABLE IF NOT EXISTS metabase.daily_sentiment (
 -- ============================================================
 CREATE INDEX IF NOT EXISTS idx_staging_platform ON staging.reviews(platform);
 CREATE INDEX IF NOT EXISTS idx_staging_item_id ON staging.reviews(item_id);
-CREATE INDEX IF NOT EXISTS idx_staging_review_date ON staging.reviews(review_date);
-CREATE INDEX IF NOT EXISTS idx_fact_review_date ON warehouse.fact_reviews(review_date);
-CREATE INDEX IF NOT EXISTS idx_fact_platform ON warehouse.fact_reviews(platform);
-
--- Create database for Metabase metadata storage
-CREATE DATABASE metabase
-    WITH OWNER analytics
-    ENCODING 'UTF8';
-
--- Create database for Apache Airflow metadata storage
-CREATE DATABASE airflow
-    WITH OWNER analytics
-    ENCODING 'UTF8';
-
+CREATE INDEX IF NOT EXISTS idx_staging_review_date ON stag

@@ -23,10 +23,10 @@ from pyspark.sql.types import StringType
 from loguru import logger
 
 # Add project root to path so we can import config
-sys.path.insert(0, str(Path(__file__).parent.parent / "scrapers"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "ingestion" / "scrapers"))
 from config import settings
 
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).parent.parent.parent
 RAW_DIR = PROJECT_ROOT / settings.RAW_DATA_DIR
 PROCESSED_DIR = PROJECT_ROOT / settings.PROCESSED_DATA_DIR
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
@@ -192,99 +192,4 @@ def read_raw(spark: SparkSession) -> DataFrame:
             f"No raw Parquet files found under {RAW_DIR}. Run scrapers first."
         )
 
-    def union_all(dfs: list) -> DataFrame:
-        all_cols = sorted({c for df in dfs for c in df.columns})
-        aligned = [
-            df.select([
-                F.col(c) if c in df.columns else F.lit(None).cast("string").alias(c)
-                for c in all_cols
-            ])
-            for df in dfs
-        ]
-        return reduce(DataFrame.union, aligned)
-
-    return union_all(dfs)
-
-
-# ---------------------------------------------------------------------------
-# Transform
-# ---------------------------------------------------------------------------
-
-def clean_and_enrich(df: DataFrame) -> DataFrame:
-    """Clean nulls, normalise types, remove empty reviews."""
-    df = (
-        df
-        .filter(F.col("comment").isNotNull() & (F.length(F.trim(F.col("comment"))) > 3))
-        .withColumn("rating", F.col("rating").cast("int"))
-        .withColumn("comment", F.trim(F.col("comment")))
-        .withColumn("review_date", F.to_date(F.col("review_time")))
-        .withColumn("year_month", F.date_format(F.col("review_time"), "yyyy-MM"))
-        .dropDuplicates(["platform", "item_id", "reviewer_name", "review_time"])
-    )
-    return df
-
-
-# ---------------------------------------------------------------------------
-# Write Processed Parquet
-# ---------------------------------------------------------------------------
-
-def write_processed(df: DataFrame) -> str:
-    out = str(PROCESSED_DIR / "reviews")
-    df.write.mode("overwrite").partitionBy("platform", "year_month").parquet(out)
-    logger.info(f"Written processed data → {out}")
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Load into PostgreSQL (staging layer)
-# ---------------------------------------------------------------------------
-
-def load_to_postgres(df: DataFrame) -> None:
-    logger.info("Loading data into PostgreSQL staging.reviews ...")
-    (
-        df.write.format("jdbc")
-        .option("url", settings.postgres_jdbc_url)
-        .option("dbtable", "staging.reviews")
-        .option("user", settings.POSTGRES_USER)
-        .option("password", settings.POSTGRES_PASSWORD)
-        .option("driver", JDBC_DRIVER)
-        .option("batchsize", 1000)
-        .mode("append")
-        .save()
-    )
-    logger.success("PostgreSQL load complete.")
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def run_pipeline():
-    logger.add(
-        PROJECT_ROOT / settings.LOGS_DIR / "spark_{time}.log",
-        rotation="50 MB",
-        level="INFO",
-    )
-    logger.info("Starting Spark pipeline...")
-
-    spark = create_spark_session()
-    spark.sparkContext.setLogLevel("WARN")
-
-    raw_df = read_raw(spark)
-    logger.info(f"Raw rows: {raw_df.count()}")
-
-    cleaned_df = clean_and_enrich(raw_df)
-    logger.info(f"Cleaned rows: {cleaned_df.count()}")
-
-    # Gemini sentiment labeling (driver-side batching)
-    labeled_df = label_sentiment_with_gemini(cleaned_df)
-
-    write_processed(labeled_df)
-    load_to_postgres(labeled_df)
-
-    spark.stop()
-    logger.success("Pipeline complete.")
-
-
-if __name__ == "__main__":
-    run_pipeline()
+    def union_all(df
