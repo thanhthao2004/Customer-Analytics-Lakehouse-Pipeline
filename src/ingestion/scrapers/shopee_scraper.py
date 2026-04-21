@@ -185,6 +185,7 @@ class ShopeeScraper:
         """
         if not self.driver:
             self.init_driver()
+        assert self.driver is not None
 
         # ── Open Shopee main page first so user can log in ────────────────────
         logger.info("[Shopee] Opening Shopee main page. You have 120 s to log in if needed.")
@@ -269,6 +270,7 @@ class ShopeeScraper:
         """Scrape reviews (and product-level fields) for a single product page."""
         if not self.driver:
             self.init_driver()
+        assert self.driver is not None
 
         surrogate_id = next(_ITEM_ID_GEN)
 
@@ -277,19 +279,27 @@ class ShopeeScraper:
         self._check_login_redirect(url)
         self._close_modals()
 
-        # Scroll down incrementally to ensure lazy-loaded sections (like reviews) trigger
-        # We scroll by 500px steps until the bottom of the page is reached (or up to 25 times)
-        last_height = self.driver.execute_script("return document.body.scrollHeight")
-        for _ in range(25):
-            self.driver.execute_script("window.scrollBy(0, 500);")
-            time.sleep(0.5)
+        # ── Deep Scroll to trigger lazy-loaded review XHR ─────────────────────
+        # Shopee reviews only load after the page bottom fires a network request.
+        # We must progressively scroll past the product specs to trigger that XHR.
+        logger.debug(f"[Shopee] Scrolling product page to trigger review loading...")
+        for _ in range(15):
+            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(0.6)
             self._close_modals()
-            new_height = self.driver.execute_script("return document.body.scrollHeight")
-            # If we've reached near the bottom, scroll back up a bit and break? No, just keep going
-            # to make sure all network requests fire.
-            
-        # Give it a couple extra seconds to render the reviews
-        time.sleep(2)
+
+        # Scroll back into the review section specifically
+        try:
+            review_section = self.driver.find_element(
+                By.XPATH,
+                "//div[contains(@class,'product-rating') or contains(@class,'pdp-block') or @id='product-rating']"
+            )
+            self.driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", review_section)
+        except Exception:
+            self.driver.execute_script("window.scrollBy(0, -800);")
+
+        # Wait for the review XHR response to populate the DOM
+        time.sleep(3)
 
         # ── Product-level fields (extracted once per page) ────────────────────
         # product_name from H1
@@ -360,171 +370,129 @@ class ShopeeScraper:
         logger.info(f"[Shopee] Scraping '{product_name[:40]}' (id={surrogate_id})…")
 
         while len(reviews) < max_reviews:
-            try:
-                review_els = WebDriverWait(self.driver, 10).until(
-                    EC.presence_of_all_elements_located(
-                        (By.CSS_SELECTOR, "div[data-cmtid]")
+            # ── Multi-selector fallback for review containers ─────────────────
+            # Shopee uses different container structures across product types.
+            # We try multiple selectors in priority order.
+            review_container_css = None
+            for selector in [
+                "div[data-cmtid]",
+                "div.shopee-product-rating",
+                ".product-ratings__item",
+                "div[class*='cmt-item']",
+                "div[class*='review-item']",
+            ]:
+                try:
+                    found = WebDriverWait(self.driver, 6).until(
+                        EC.presence_of_all_elements_located((By.CSS_SELECTOR, selector))
                     )
-                )
-            except TimeoutException:
-                logger.debug(f"[Shopee] No reviews visible for '{product_name[:30]}'.")
-                break
-
-            # Extract all review data quickly using JavaScript to avoid StaleElementReferenceException
-            try:
-                js_script = """
-                return Array.from(document.querySelectorAll('div[data-cmtid]')).map(el => {
-                    let rating = 0;
-                    el.querySelectorAll('svg.shopee-svg-icon').forEach(s => {
-                        if (s.classList.contains('icon-rating-solid')) rating++;
-                        else if (s.classList.contains('icon-rating')) {
-                            let poly = s.querySelector('polygon');
-                            if (poly && poly.getAttribute('fill') !== 'none') rating++;
-                        }
-                    });
-                    if (rating > 5) rating = 5;
-                    
-                    let comment = '';
-                    let c_el = el.querySelector('.YNedDV');
-                    if (c_el) comment = c_el.innerText.trim();
-                    
-                    let reviewer_name = 'anonymous';
-                    let r_el = el.querySelector('.InK5kS');
-                    if (r_el) reviewer_name = r_el.innerText.trim();
-                    
-                    let ts = '';
-                    let t_el = el.querySelector('.XYk98l');
-                    if (t_el) ts = t_el.innerText.trim();
-                    
-                    return {rating, comment, reviewer_name, ts};
-                });
-                """
-                page_reviews = self.driver.execute_script(js_script)
-                
-                for r_data in page_reviews:
-                    if not r_data.get('comment'):
-                        continue
-                        
-                    review_time_val = datetime.utcnow()
-                    ts = r_data.get('ts')
-                    if ts:
-                        try:
-                            review_time_val = datetime.strptime(ts, "%Y-%m-%d %H:%M")
-                        except Exception:
-                            pass
-                            
-                    reviews.append({
-                        "platform":      "shopee",
-                        "brand":         page_brand,
-                        "item_id":       surrogate_id,
-                        "product_name":  product_name,
-                        "skin_type":     skin_type,
-                        "total_like":    total_like,
-                        "formula":       formula,
-                        "time_delivery": time_delivery,
-                        "price":         price,
-                        "flash_sale":    flash_sale,
-                        "rating":        r_data.get('rating', 0),
-                        "comment":       r_data.get('comment', ''),
-                        "reviewer_name": r_data.get('reviewer_name', 'anonymous'),
-                        "review_time":   review_time_val,
-                    })
-            except Exception as exc:
-                logger.debug(f"[Shopee] Review JS execution error: {exc}")
-
-            # Paginate reviews
-            try:
-                next_btn = self.driver.find_element(
-                    By.CSS_SELECTOR, "button.shopee-icon-button--right"
-                )
-                if not next_btn.is_enabled():
-                    break
-                self.driver.execute_script("arguments[0].click();", next_btn)
-                time.sleep(2)
-                self._close_modals()
-                page_count += 1
-                if page_count >= max(3, max_reviews // 5):
-                    break
-            except NoSuchElementException:
-                break
-
-        logger.info(
-            f"[Shopee] Collected {len(reviews)} reviews for '{product_name[:40]}'."
-        )
-        return reviews[:max_reviews]
-
-    # ── Parquet Persistence ───────────────────────────────────────────────────
-
-    def save_to_parquet(self, reviews: list[dict], filename: str) -> Path | None:
-        if not reviews:
-            logger.warning("[Shopee] No reviews to save.")
-            return None
-        out = self.output_dir / filename
-        table = pa.Table.from_pylist(reviews, schema=SHOPEE_SCHEMA)
-        pq.write_table(table, out, compression="snappy")
-        logger.info(f"[Shopee] Saved {len(reviews)} reviews → {out}")
-        return out
-
-    # ── Orchestration ─────────────────────────────────────────────────────────
-
-    def run(
-        self,
-        products: list[dict] | None = None,
-        max_reviews_per_product: int = 1000,
-    ) -> Path | None:
-        """Discover products → scrape reviews → save to local Parquet."""
-        
-        ckpt_path = self.output_dir / "scraped_urls.json"
-        scraped_urls = set()
-        if ckpt_path.exists():
-            try:
-                scraped_urls = set(json.loads(ckpt_path.read_text("utf-8")))
-                logger.info(f"[Shopee] Loaded checkpoint: {len(scraped_urls)} products already scraped.")
-            except Exception as e:
-                logger.warning(f"[Shopee] Failed to load checkpoint: {e}")
-
-        if products is None:
-            products = self.discover_products(target_count=100)
-
-        # Ensure output directory exists before writing per-product files
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-        try:
-            for p in products:
-                url = p.get("url", "")
-                if url in scraped_urls:
-                    logger.info(f"[Shopee] Skipping already scraped product: {p.get('product_name', 'Unknown')[:30]}...")
+                    if found:
+                        review_container_css = selector
+                        logger.debug(f"[Shopee] Review selector matched: '{selector}' ({len(found)} els)")
+                        break
+                except TimeoutException:
                     continue
 
-                item_id_raw = p.get("item_id_raw", "0")
+            if not review_container_css:
+                logger.warning(f"[Shopee] No review containers found for '{product_name[:30]}'. Skipping.")
+                break
 
-                revs = self.scrape_item(
-                    brand=p.get("brand", "Unknown"),
-                    shop_id_raw=p.get("shop_id_raw", "0"),
-                    item_id_raw=item_id_raw,
-                    product_name=p.get("product_name", ""),
-                    url=url,
-                    max_reviews=max_reviews_per_product,
-                )
-                
-                if revs:
-                    fname = f"shopee_{item_id_raw}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.parquet"
-                    self.save_to_parquet(revs, fname)
-                
-                # Update checkpoint
-                scraped_urls.add(url)
-                ckpt_path.write_text(json.dumps(list(scraped_urls)), "utf-8")
-                
-        finally:
-            if self.driver:
-                self.driver.quit()
+            # Extract all review data using structural/semantic selectors (not obfuscated class names)
+            # This is robust to Shopee's weekly React class-name rotation.
+            try:
+                js_script = f"""
+                var container_sel = {repr(review_container_css)};
+                return Array.from(document.querySelectorAll(container_sel)).map(function(el) {{
 
-        return self.output_dir
+                    // ── Rating: count filled star SVGs ──────────────────────────
+                    var rating = 0;
+                    var stars = el.querySelectorAll('svg');
+                    stars.forEach(function(s) {{
+                        var cls = s.className && s.className.baseVal ? s.className.baseVal : '';
+                        if (cls.indexOf('icon-rating-solid') !== -1 || cls.indexOf('rating--on') !== -1) {{
+                            rating++;
+                        }} else if (cls.indexOf('icon-rating') !== -1 || cls.indexOf('rating--off') !== -1) {{
+                            var poly = s.querySelector('polygon,path');
+                            if (poly && poly.getAttribute('fill') && poly.getAttribute('fill') !== 'none' && poly.getAttribute('fill') !== '#fff') {{
+                                rating++;
+                            }}
+                        }}
+                    }});
+                    if (rating === 0) {{
+                        // Fallback: count aria-label stars or data-score
+                        var scoreEl = el.querySelector('[data-score],[aria-label*="sao"],[aria-label*="star"]');
+                        if (scoreEl) {{
+                            var score = parseInt(scoreEl.getAttribute('data-score') || scoreEl.getAttribute('aria-label') || '0');
+                            if (!isNaN(score)) rating = score;
+                        }}
+                    }}
+                    if (rating > 5) rating = 5;
 
+                    // ── Comment: use structural query, not obfuscated class ────
+                    var comment = '';
+                    // Try ordered list of stable structural selectors
+                    var comment_selectors = [
+                        '[class*="content"][class*="review"]',
+                        '[class*="cmt"][class*="text"]',
+                        '[class*="comment"] p',
+                        '[class*="review"] p',
+                        'p[class*="text"]'
+                    ];
+                    for (var i = 0; i < comment_selectors.length; i++) {{
+                        var cel = el.querySelector(comment_selectors[i]);
+                        if (cel && cel.innerText && cel.innerText.trim().length > 3) {{
+                            comment = cel.innerText.trim();
+                            break;
+                        }}
+                    }}
+                    // Final fallback: grab the longest text block inside the container
+                    if (!comment) {{
+                        var all_text = Array.from(el.querySelectorAll('p,span,div'))
+                            .filter(function(e) {{ return e.children.length === 0; }})
+                            .map(function(e) {{ return e.innerText ? e.innerText.trim() : ''; }})
+                            .filter(function(t) {{ return t.length > 10; }});
+                        if (all_text.length > 0) {{
+                            comment = all_text.reduce(function(a,b) {{ return a.length > b.length ? a : b; }}, '');
+                        }}
+                    }}
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+                    // ── Reviewer name ──────────────────────────────────────────
+                    var reviewer_name = 'anonymous';
+                    var reviewer_selectors = [
+                        '[class*="name"]', '[class*="user"]', '[class*="author"]',
+                        'a[href*="/profile/"]'
+                    ];
+                    for (var j = 0; j < reviewer_selectors.length; j++) {{
+                        var rel = el.querySelector(reviewer_selectors[j]);
+                        if (rel && rel.innerText && rel.innerText.trim().length > 0) {{
+                            reviewer_name = rel.innerText.trim();
+                            break;
+                        }}
+                    }}
 
-if __name__ == "__main__":
-    scraper = ShopeeScraper()
-    output = scraper.run(max_reviews_per_product=1000)
-    print(f"Done! Saved to: {output}")
+                    // ── Timestamp ─────────────────────────────────────────────
+                    var ts = '';
+                    var time_selectors = [
+                        'time', '[datetime]', '[class*="time"]', '[class*="date"]'
+                    ];
+                    for (var k = 0; k < time_selectors.length; k++) {{
+                        var tel = el.querySelector(time_selectors[k]);
+                        if (tel) {{
+                            ts = tel.getAttribute('datetime') || tel.innerText.trim();
+                            if (ts) break;
+                        }}
+                    }}
+
+                    return {{rating: rating, comment: comment, reviewer_name: reviewer_name, ts: ts}};
+                }});
+                """
+                page_reviews = self.driver.execute_script(js_script)
+                logger.debug(f"[Shopee] JS extracted {len(page_reviews) if page_reviews else 0} raw review blocks.")
+
+                for r_data in (page_reviews or []):
+                    if not r_data.get('comment'):
+                        continue
+
+                    review_time_val = datetime.utcnow()
+                    ts = r_data.get('ts', '')
+                    if ts:
+      

@@ -1,0 +1,31 @@
+##  Master AI Prompt for Developing Your Lakehouse Project
+
+**Instructions for you:** 
+Copy the entire prompt below and paste it into Claude (or ChatGPT) along with the three `skills/` Markdown files. Whenever you want to generate a resume bullet point, prepare for an interview, or add a new pipeline feature, just add your specific task to the very bottom!
+
+---
+*(Copy from here down)*
+
+**Role:** Act as an elite Senior Data Architect and Career Consultant. 
+
+**Context:** I am the lead Data Engineer and Architect who independently built the "Customer Analytics Lakehouse Pipeline." I have attached three context documents outlining my exact architecture, my business impact, and my data modeling techniques across the Business Analyst, Data Analyst, and Data Engineer personas. 
+My pipeline involves:
+- Complex Python/Selenium headless scraping circumventing anti-bot frameworks, chunking massive Data payloads into Parquet formats over local memory.
+- A decoupled dual-infrastructure mapping a Mac extraction host to an Ubuntu Dockerized infrastructure VM.
+- Data Observability pipelines using PySpark integrating Native Delta Lake over S3 MinIO storage.
+- An automated Apache Airflow Event-Driven architecture utilizing `S3KeySensors`.
+- dbt Star-Schema data warehousing in PostgreSQL fueling Metabase Time-Series cohort analyses.
+
+**Constraints:**
+- Do not use overly theoretical jargon; ground every answer strictly in the practical technologies and architecture from my attached documents.
+- Whenever describing my work, emphasize scalable architecture, automated orchestration, and revenue-saving ROI logic.
+- Tone should be authoritative, technical, and impact-focused.
+
+**Task:**
+Please review the attached documents. Once you understand the architecture, I need you to complete the following specific task based on my project:
+
+ **[INSERT YOUR SPECIFIC REQUEST HERE, FOR EXAMPLE:]**
+* *"Write 4 extremely strong Data Engineer resume bullet points reflecting my Delta Lake and S3 Orchestration skills."*
+* *"Format a system-architecture interview response explaining why I separated my Mac Host and Ubuntu VM."*
+* *"Write a Python script to add a 'Great Expectations' suite into my Spark pipeline before it writes to PostgreSQL."*
+* *"Draft a project summary for my LinkedIn profile targeting Senior Data Analyst roles."*

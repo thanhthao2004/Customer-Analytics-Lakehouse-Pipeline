@@ -46,7 +46,6 @@ def step_spark():
     run_cmd(
         [
             "spark-submit",
-            "--packages", "org.postgresql:postgresql:42.7.3",
             "src/processing/spark_pipeline.py",
         ],
         cwd=PROJECT_ROOT,
@@ -82,4 +81,64 @@ def interactive_menu():
     print("\n[  UBUNTU VM ]")
     print("  2. Start Infrastructure (MinIO, Airflow, Postgres, Metabase)")
     print("  3. Stop Infrastructure")
-    print("  4. Run PySpark Processing (Raw 
+    print("  4. Run PySpark Processing (Raw Data -> Clean PostgreSQL)")
+    print("  5. Run dbt Transformations (Warehouse -> Data Marts)")
+    print("\n  0. Exit")
+    print("==========================================================")
+    
+    try:
+        choice = input("Enter your choice [0-5]: ").strip()
+    except KeyboardInterrupt:
+        print("\nExiting.")
+        sys.exit(0)
+        
+    if choice == '1':
+        step_scrape()
+    elif choice == '2':
+        logger.info("=== STEP: Start Docker Infra ===")
+        run_cmd(["docker", "compose", "up", "-d"], cwd=PROJECT_ROOT)
+    elif choice == '3':
+        logger.info("=== STEP: Stop Docker Infra ===")
+        run_cmd(["docker", "compose", "down"], cwd=PROJECT_ROOT)
+    elif choice == '4':
+        step_spark()
+    elif choice == '5':
+        step_dbt()
+    elif choice == '0':
+        print("Exiting.")
+        sys.exit(0)
+    else:
+        print("Invalid choice, please select 0-5.")
+
+def main():
+    parser = argparse.ArgumentParser(description="Customer Analytics Pipeline Orchestrator")
+    parser.add_argument(
+        "--step",
+        choices=["all", "scrape", "spark", "dbt", "interactive"],
+        default="interactive",
+        help="Which step to run (default: interactive CLI GUI)",
+    )
+    args = parser.parse_args()
+
+    logger.add(
+        PROJECT_ROOT / "logs" / "orchestrator_{time}.log",
+        rotation="50 MB",
+        level="INFO",
+    )
+
+    if args.step == "interactive":
+        while True:
+            interactive_menu()
+    else:
+        if args.step in ("all", "scrape"):
+            step_scrape()
+        if args.step in ("all", "spark"):
+            step_spark()
+        if args.step in ("all", "dbt"):
+            step_dbt()
+
+        logger.success("🎉 Pipeline complete!")
+
+
+if __name__ == "__main__":
+    main()

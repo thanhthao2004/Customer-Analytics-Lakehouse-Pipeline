@@ -11,6 +11,7 @@ Steps:
 5. Load processed data into PostgreSQL staging tables
 """
 
+import os
 import sys
 import time
 from functools import reduce
@@ -159,10 +160,23 @@ def label_sentiment_with_gemini(df: DataFrame) -> DataFrame:
 # ---------------------------------------------------------------------------
 
 def create_spark_session() -> SparkSession:
+    minio_endpoint = os.getenv("MINIO_ENDPOINT", "minio:9000")
+    if not minio_endpoint.startswith("http"):
+        minio_endpoint = f"http://{minio_endpoint}"
+
     return (
         SparkSession.builder.appName("CustomerAnalyticsPipeline")
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
         .config("spark.sql.shuffle.partitions", "4")
         .config("spark.driver.memory", "2g")
+        .config("spark.jars.packages", "org.postgresql:postgresql:42.7.3,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262,io.delta:delta-spark_2.12:3.1.0")
+        .config("spark.hadoop.fs.s3a.endpoint", minio_endpoint)
+        .config("spark.hadoop.fs.s3a.access.key", os.getenv("MINIO_ACCESS_KEY", "admin"))
+        .config("spark.hadoop.fs.s3a.secret.key", os.getenv("MINIO_SECRET_KEY", "adminpassword"))
+        .config("spark.hadoop.fs.s3a.path.style.access", "true")
+        .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
+        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
         .getOrCreate()
     )
 
@@ -175,21 +189,144 @@ def read_raw(spark: SparkSession) -> DataFrame:
     """Read all Parquet files from raw shopee + lazada dirs."""
     dfs = []
     for platform in ["shopee", "lazada"]:
-        platform_dir = RAW_DIR / platform
-        if platform_dir.exists() and list(platform_dir.glob("*.parquet")):
-            # Requirement: Use a PySpark script to read the shared directory & automatically merge chunked files
-            path_pattern = f"{platform_dir}/*.parquet"
-            logger.info(f"Reading raw data from VM Shared folder: {path_pattern}")
-            
-            # This single command merges the 100+ separate shopee_{id}.parquet chunked files into a unified dataset
+        path_pattern = f"s3a://raw-data/{platform}/*.parquet"
+        try:
+            logger.info(f"Reading raw data from MinIO S3: {path_pattern}")
             df = spark.read.parquet(path_pattern)
             dfs.append(df)
-        else:
-            logger.warning(f"No parquet files found in {platform_dir}, skipping.")
+        except Exception as e:
+            logger.warning(f"No parquet files found or accessible for {platform} at {path_pattern}: {e}")
 
     if not dfs:
         raise FileNotFoundError(
             f"No raw Parquet files found under {RAW_DIR}. Run scrapers first."
         )
 
-    def union_all(df
+    def union_all(dfs: list) -> DataFrame:
+        all_cols = sorted({c for df in dfs for c in df.columns})
+        aligned = [
+            df.select([
+                F.col(c) if c in df.columns else F.lit(None).cast("string").alias(c)
+                for c in all_cols
+            ])
+            for df in dfs
+        ]
+        return reduce(DataFrame.union, aligned)
+
+    return union_all(dfs)
+
+
+# ---------------------------------------------------------------------------
+# Data Quality & Transform
+# ---------------------------------------------------------------------------
+
+def clean_and_enrich(df: DataFrame) -> DataFrame:
+    """Clean nulls, normalise types, remove empty reviews."""
+    df = (
+        df
+        .withColumn("rating", F.col("rating").cast("int"))
+        .withColumn("comment", F.trim(F.col("comment")))
+        .withColumn("review_date", F.to_date(F.col("review_time")))
+        .withColumn("year_month", F.date_format(F.col("review_time"), "yyyy-MM"))
+        .dropDuplicates(["platform", "item_id", "reviewer_name", "review_time"])
+    )
+    return df
+
+def check_data_quality(df: DataFrame) -> DataFrame:
+    """
+    Enforce Data Quality by verifying:
+    1. Rating is between 1 and 5
+    2. Comment length > 3
+    3. Item ID is not null
+    Quarantines bad records and returns only good records.
+    """
+    quality_cond = (
+        F.col("item_id").isNotNull() &
+        F.col("rating").between(1, 5) &
+        (F.length(F.col("comment")) > 3)
+    )
+    
+    # Split records
+    good_df = df.filter(quality_cond)
+    bad_df = df.filter(~quality_cond)
+    
+    bad_count = bad_df.count()
+    if bad_count > 0:
+        logger.warning(f"Data Quality Check Failed for {bad_count} records. Moving to Quarantine S3 bucket.")
+        quarantine_path = "s3a://raw-data/quarantine_reviews"
+        try:
+            bad_df.write.format("parquet").mode("append").save(quarantine_path)
+            logger.info(f"Quarantined {bad_count} records to {quarantine_path}")
+        except Exception as e:
+            logger.error(f"Failed to write quarantine data: {e}")
+            
+    return good_df
+
+
+# ---------------------------------------------------------------------------
+# Write Processed Parquet
+# ---------------------------------------------------------------------------
+
+def write_processed(df: DataFrame) -> str:
+    out = "s3a://raw-data/processed_delta"
+    logger.info(f"Writing processed Delta tables to MinIO -> {out}")
+    df.write.format("delta").mode("overwrite").partitionBy("platform", "year_month").save(out)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Load into PostgreSQL (staging layer)
+# ---------------------------------------------------------------------------
+
+def load_to_postgres(df: DataFrame) -> None:
+    logger.info("Loading data into PostgreSQL staging.reviews ...")
+    (
+        df.write.format("jdbc")
+        .option("url", settings.postgres_jdbc_url)
+        .option("dbtable", "staging.reviews")
+        .option("user", settings.POSTGRES_USER)
+        .option("password", settings.POSTGRES_PASSWORD)
+        .option("driver", JDBC_DRIVER)
+        .option("batchsize", 1000)
+        .mode("append")
+        .save()
+    )
+    logger.success("PostgreSQL load complete.")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def run_pipeline():
+    logger.add(
+        PROJECT_ROOT / settings.LOGS_DIR / "spark_{time}.log",
+        rotation="50 MB",
+        level="INFO",
+    )
+    logger.info("Starting Spark pipeline...")
+
+    spark = create_spark_session()
+    spark.sparkContext.setLogLevel("WARN")
+
+    raw_df = read_raw(spark)
+    logger.info(f"Raw rows: {raw_df.count()}")
+
+    cleaned_df = clean_and_enrich(raw_df)
+    
+    # Apply Data Quality Constraints
+    validated_df = check_data_quality(cleaned_df)
+    logger.info(f"Validated clean rows: {validated_df.count()}")
+
+    # Gemini sentiment labeling (driver-side batching)
+    labeled_df = label_sentiment_with_gemini(validated_df)
+
+    write_processed(labeled_df)
+    load_to_postgres(labeled_df)
+
+    spark.stop()
+    logger.success("Pipeline complete.")
+
+
+if __name__ == "__main__":
+    run_pipeline()

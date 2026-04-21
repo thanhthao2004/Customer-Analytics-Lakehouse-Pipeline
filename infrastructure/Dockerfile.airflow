@@ -11,4 +11,4 @@ RUN apt-get update \
 
 USER airflow
 # Install dependencies for Lakehouse pipeline
-RUN pip install --no-cache-dir "apache-airflow==2.8.1" dbt-postgres pyspark loguru pyarrow
+RUN pip install --no-cache-dir "apache-airflow==2.8.1" dbt-postgres pyspark loguru pyarrow delta-spark==3.1.0 boto3==1.34.0 minio==7.2.4 apache-airflow-providers-amazon==8.19.0

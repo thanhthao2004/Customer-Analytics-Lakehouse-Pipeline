@@ -72,4 +72,4 @@ if __name__ == "__main__":
     )
     logger.info("Starting Data Ingestion Layer: Local to MinIO")
     upload_folder_to_minio()
-    logger.info("Upload proces
+    logger.info("Upload process complete.")

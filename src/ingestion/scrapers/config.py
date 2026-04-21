@@ -38,4 +38,7 @@ class Settings:
     MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", 3))
 
     # Gemini API
-    GE
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+
+
+settings = Settings()
