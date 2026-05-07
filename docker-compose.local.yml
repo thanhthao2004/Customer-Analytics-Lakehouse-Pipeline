@@ -1,0 +1,86 @@
+# Local development stack — runs on Mac with Docker Desktop
+# Lightweight: no custom builds, only official pre-built images
+# Use this while the Ubuntu VM disk is full / SSD is arriving.
+#
+# Usage:
+#   docker compose -f docker-compose.local.yml up -d
+#   docker compose -f docker-compose.local.yml down
+
+services:
+
+  # ── PostgreSQL Data Warehouse ────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: local_analytics_postgres
+    environment:
+      POSTGRES_USER: analytics
+      POSTGRES_PASSWORD: analytics123
+      POSTGRES_DB: customer_analytics
+    ports:
+      - "5432:5432"
+    volumes:
+      - local_postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/init_db:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U analytics -d customer_analytics"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── MinIO — Local S3 Data Lake ───────────────────────────────────────────
+  minio:
+    image: minio/minio
+    container_name: local_analytics_minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: adminpassword
+    command: server /data --console-address ":9001"
+    volumes:
+      - local_minio_data:/data
+
+  # ── MinIO bucket bootstrap ───────────────────────────────────────────────
+  # Uses retry loop instead of fixed sleep — avoids race condition where
+  # minio-init starts before the MinIO API is ready to accept connections.
+  minio-init:
+    image: minio/mc
+    container_name: local_analytics_minio_init
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      echo 'Waiting for MinIO API to be ready...';
+      until /usr/bin/mc alias set myminio http://minio:9000 admin adminpassword; do
+        echo 'MinIO not ready yet — retrying in 3s...';
+        sleep 3;
+      done;
+      echo 'MinIO is ready. Creating raw-data bucket...';
+      /usr/bin/mc mb --ignore-existing myminio/raw-data;
+      /usr/bin/mc anonymous set download myminio/raw-data;
+      echo 'Bucket raw-data created successfully.';
+      /usr/bin/mc ls myminio;
+      exit 0;
+      "
+
+  # ── Metabase — Dashboard ─────────────────────────────────────────────────
+  metabase:
+    image: metabase/metabase:latest
+    container_name: local_analytics_metabase
+    ports:
+      - "3000:3000"
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: customer_analytics
+      MB_DB_PORT: 5432
+      MB_DB_USER: analytics
+      MB_DB_PASS: analytics123
+      MB_DB_HOST: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  local_postgres_data:
+  local_minio_data:

@@ -4,8 +4,13 @@ Uses Selenium (undetected_chromedriver) to bypass captchas/Datadome.
 
 Target: Skincare products on Lazada VN (Health & Beauty > Skincare)
 URL pattern: lazada.vn/products/-i{item_id}.html
+
+Cloud/GHA mode:
+  Set CI=true to enable headless mode + GHA Chrome flags.
+  Set PROXY_HOST/PROXY_PORT/PROXY_USER/PROXY_PASS for residential proxy.
 """
 
+import os
 import time
 import random
 import ssl
@@ -13,8 +18,25 @@ import re
 from pathlib import Path
 from datetime import datetime
 
-# Bypass macOS SSL certificate verification for undetected_chromedriver downloads
-ssl._create_default_https_context = ssl._create_unverified_context
+# On macOS (local dev) bypass SSL verification for uc driver downloads.
+if ssl.OPENSSL_VERSION.startswith("OpenSSL") and os.name == "posix" and not os.environ.get("CI"):
+    ssl._create_default_https_context = ssl._create_unverified_context
+
+# ── Cloud / GHA detection ─────────────────────────────────────────────────────
+IS_CI = os.environ.get("CI", "").lower() in ("true", "1", "yes")
+
+# ── Proxy config ─────────────────────────────────────────────────────────────
+PROXY_HOST = os.environ.get("PROXY_HOST", "")
+PROXY_PORT = os.environ.get("PROXY_PORT", "")
+PROXY_USER = os.environ.get("PROXY_USER", "")
+PROXY_PASS = os.environ.get("PROXY_PASS", "")
+
+# ── S3 / R2 upload config ─────────────────────────────────────────────────────
+S3_BUCKET       = os.environ.get("S3_BUCKET", "")
+S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL", "")
+AWS_ACCESS_KEY  = os.environ.get("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_KEY  = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+AWS_REGION      = os.environ.get("AWS_REGION", "auto")
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -52,13 +74,42 @@ class LazadaScraper:
 
     def init_driver(self):
         options = uc.ChromeOptions()
-        # options.add_argument("--headless") # Comment out to debug visually
-        options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1280,1024")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        # Force chrome driver version to match local OS installed Chrome 146
-        self.driver = uc.Chrome(options=options, version_main=146)
+
+        # ── GHA headless flags ───────────────────────────────────────────────────
+        if IS_CI:
+            options.add_argument("--headless=new")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--window-size=1280,1024")
+            options.add_argument("--disable-extensions")
+            options.add_argument("--disable-setuid-sandbox")
+        else:
+            options.add_argument("--disable-gpu")
+            options.add_argument("--window-size=1280,1024")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+
+        # ── Proxy injection ───────────────────────────────────────────────────
+        if PROXY_HOST and PROXY_PORT:
+            options.add_argument(f"--proxy-server=http://{PROXY_HOST}:{PROXY_PORT}")
+            logger.info(f"[Lazada] Using proxy: {PROXY_HOST}:{PROXY_PORT}")
+
+        # version_main=None → auto-detect installed Chrome version on GHA runner
+        chrome_version = None if IS_CI else 146
+        self.driver = uc.Chrome(options=options, version_main=chrome_version)
+
+        # CDP proxy auth (authenticated proxies)
+        if IS_CI and PROXY_HOST and PROXY_USER and PROXY_PASS:
+            self.driver.execute_cdp_cmd("Network.enable", {})
+            self.driver.execute_cdp_cmd(
+                "Network.setExtraHTTPHeaders",
+                {"headers": {
+                    "Proxy-Authorization": __import__('base64').b64encode(
+                        f"{PROXY_USER}:{PROXY_PASS}".encode()
+                    ).decode()
+                }}
+            )
 
     def force_close_modals(self):
         """Use Javascript to forcefully destroy Lazada's blocking popups & overlays."""
@@ -250,7 +301,34 @@ class LazadaScraper:
         table = pa.Table.from_pylist(reviews, schema=LAZADA_SCHEMA)
         pq.write_table(table, out_path, compression="snappy")
         logger.info(f"[Lazada] Saved {len(reviews)} reviews → {out_path}")
+
+        # ── Auto-upload to R2/S3 when running on GHA ──────────────────────────
+        if IS_CI and S3_BUCKET and AWS_ACCESS_KEY:
+            self._upload_to_s3(out_path)
+
         return out_path
+
+    def _upload_to_s3(self, local_path: Path) -> None:
+        """Upload a local Parquet file to Cloudflare R2 or AWS S3."""
+        try:
+            import boto3
+            from botocore.config import Config
+
+            endpoint = S3_ENDPOINT_URL or None
+            s3 = boto3.client(
+                "s3",
+                endpoint_url=endpoint,
+                aws_access_key_id=AWS_ACCESS_KEY,
+                aws_secret_access_key=AWS_SECRET_KEY,
+                region_name=AWS_REGION,
+                config=Config(signature_version="s3v4"),
+            )
+            run_ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            key    = f"raw/lazada/{run_ts}/{local_path.name}"
+            s3.upload_file(str(local_path), S3_BUCKET, key)
+            logger.info(f"[Lazada] Uploaded → s3://{S3_BUCKET}/{key}")
+        except Exception as exc:
+            logger.warning(f"[Lazada] S3 upload failed (continuing): {exc}")
 
     def run(
         self,

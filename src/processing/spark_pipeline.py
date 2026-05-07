@@ -1,76 +1,71 @@
 """
-PySpark processing pipeline.
+PySpark processing pipeline — Cloud S3 / Cloudflare R2 edition.
 
-Steps:
-1. Read raw Parquet files from data/raw/shopee and data/raw/lazada
-2. Clean & normalize
-3. Add sentiment_label (positive/negative/neutral) via Google Gemini Flash API
-   - Batches 50 reviews per API call to stay within free-tier limits (15 req/min)
-   - Falls back to "neutral" on any API error
-4. Write processed Parquet to data/processed/
-5. Load processed data into PostgreSQL staging tables
+Environment variables (set as GitHub Secrets):
+  S3_BUCKET, S3_ENDPOINT_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
+  POSTGRES_HOST/PORT/USER/PASSWORD/DB, GEMINI_API_KEY, SPARK_DRIVER_MEMORY
 """
 
 import os
 import sys
 import time
 from functools import reduce
-from pathlib import Path
 from datetime import datetime
 
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
-from pyspark.sql.types import StringType
 from loguru import logger
 
-# Add project root to path so we can import config
-sys.path.insert(0, str(Path(__file__).parent.parent / "ingestion" / "scrapers"))
-from config import settings
+# ---------------------------------------------------------------------------
+# Config from environment — no local file fallback in cloud mode
+# ---------------------------------------------------------------------------
+S3_BUCKET    = os.environ["S3_BUCKET"]
+S3_ENDPOINT  = os.environ.get("S3_ENDPOINT_URL", "")
+AWS_KEY      = os.environ["AWS_ACCESS_KEY_ID"]
+AWS_SECRET   = os.environ["AWS_SECRET_ACCESS_KEY"]
+AWS_REGION   = os.environ.get("AWS_REGION", "auto")
 
-PROJECT_ROOT = Path(__file__).parent.parent.parent
-RAW_DIR = PROJECT_ROOT / settings.RAW_DATA_DIR
-PROCESSED_DIR = PROJECT_ROOT / settings.PROCESSED_DATA_DIR
-PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "localhost")
+POSTGRES_PORT = os.environ.get("POSTGRES_PORT", "5432")
+POSTGRES_USER = os.environ.get("POSTGRES_USER", "analytics")
+POSTGRES_PASS = os.environ.get("POSTGRES_PASSWORD", "")
+POSTGRES_DB   = os.environ.get("POSTGRES_DB", "customer_analytics")
 
+GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
+DRIVER_MEMORY   = os.environ.get("SPARK_DRIVER_MEMORY", "4g")
+EXECUTOR_MEMORY = os.environ.get("SPARK_EXECUTOR_MEMORY", "2g")
+
+JDBC_URL    = f"jdbc:postgresql://{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
 JDBC_DRIVER = "org.postgresql.Driver"
 
+# S3 paths
+RAW_SHOPEE_PATH = f"s3a://{S3_BUCKET}/raw/shopee/*/*.parquet"
+RAW_LAZADA_PATH = f"s3a://{S3_BUCKET}/raw/lazada/*/*.parquet"
+DELTA_OUT_PATH  = f"s3a://{S3_BUCKET}/processed_delta"
+QUARANTINE_PATH = f"s3a://{S3_BUCKET}/quarantine_reviews"
+
+# Gemini settings
+GEMINI_MODEL        = "gemini-2.0-flash"
+GEMINI_BATCH_SIZE   = 50
+GEMINI_MIN_INTERVAL = 4.1   # ~14 req/min vs free tier 15
+
+
 # ---------------------------------------------------------------------------
-# Gemini sentiment helper (runs on driver, called via pandas UDF)
+# Gemini sentiment
 # ---------------------------------------------------------------------------
-
-GEMINI_MODEL = "gemini-2.0-flash"
-GEMINI_BATCH_SIZE = 50          # reviews per API call
-GEMINI_MIN_INTERVAL = 4.1       # seconds between calls → ~14 req/min (free tier: 15)
-
-
-def _label_batch_via_gemini(comments: list[str]) -> list[str]:
-    """
-    Send a batch of comments to Gemini Flash and return
-    a list of labels: 'positive', 'negative', or 'neutral'.
-
-    The prompt is designed for Vietnamese + English mixed text.
-    """
+def _label_batch_via_gemini(comments: list) -> list:
     from google import genai
-
-    client = genai.Client(api_key=settings.GEMINI_API_KEY)
-
+    client = genai.Client(api_key=GEMINI_API_KEY)
     numbered = "\n".join(f"{i+1}. {c}" for i, c in enumerate(comments))
     prompt = (
         "Bạn là chuyên gia phân tích cảm xúc cho review sản phẩm skincare.\n"
-        "Dưới đây là danh sách các review được đánh số. "
-        "Phân loại CẢM XÚC của MỖI review thành MỘT trong ba nhãn sau: "
+        "Phân loại CẢM XÚC của MỖI review thành MỘT trong ba nhãn: "
         "positive, negative, neutral.\n"
-        "Chỉ trả về danh sách nhãn theo đúng thứ tự số, mỗi nhãn trên một dòng, "
-        "không giải thích thêm. Ví dụ:\n"
-        "positive\nneutral\nnegative\n\n"
+        "Chỉ trả về danh sách nhãn theo đúng thứ tự, mỗi nhãn trên một dòng.\n\n"
         f"Danh sách review:\n{numbered}"
     )
-
     try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-        )
+        response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
         lines = [ln.strip().lower() for ln in response.text.strip().splitlines() if ln.strip()]
         labels = []
         for ln in lines:
@@ -80,149 +75,140 @@ def _label_batch_via_gemini(comments: list[str]) -> list[str]:
                 labels.append("negative")
             else:
                 labels.append("neutral")
-
-        # Ensure we have the same count as input
         if len(labels) != len(comments):
-            logger.warning(
-                f"Gemini returned {len(labels)} labels for {len(comments)} comments. "
-                "Padding with 'neutral'."
-            )
+            logger.warning(f"Gemini label count mismatch ({len(labels)} vs {len(comments)}). Padding.")
             labels += ["neutral"] * (len(comments) - len(labels))
             labels = labels[:len(comments)]
-
         return labels
-
     except Exception as exc:
-        logger.warning(f"Gemini API error: {exc} — defaulting to 'neutral' for batch")
+        logger.warning(f"Gemini API error: {exc} — defaulting all to 'neutral'")
         return ["neutral"] * len(comments)
 
 
 def label_sentiment_with_gemini(df: DataFrame) -> DataFrame:
-    """
-    Collect the comment column, batch-call Gemini, and join labels back.
-    This runs on the Spark driver (not distributed) which is fine for
-    up to ~100k rows; for millions, partition and use pandas UDF instead.
-    """
     logger.info("Running Gemini sentiment labeling...")
-
-    if not settings.GEMINI_API_KEY:
-        logger.warning("GEMINI_API_KEY not set — all labels will be 'neutral'")
+    if not GEMINI_API_KEY:
+        logger.warning("GEMINI_API_KEY not set — labeling all as 'neutral'")
         return df.withColumn("sentiment_label", F.lit("neutral"))
 
-    # Collect to driver
     rows = df.select("comment").collect()
     comments = [r["comment"] or "" for r in rows]
-
     labels = []
     for i in range(0, len(comments), GEMINI_BATCH_SIZE):
         batch = comments[i: i + GEMINI_BATCH_SIZE]
-        batch_labels = _label_batch_via_gemini(batch)
-        labels.extend(batch_labels)
-        logger.info(
-            f"  Labeled {min(i + GEMINI_BATCH_SIZE, len(comments))}/{len(comments)} reviews"
-        )
+        labels.extend(_label_batch_via_gemini(batch))
+        logger.info(f"  Labeled {min(i + GEMINI_BATCH_SIZE, len(comments))}/{len(comments)}")
         if i + GEMINI_BATCH_SIZE < len(comments):
             time.sleep(GEMINI_MIN_INTERVAL)
 
-    # Attach row index so we can join back
     from pyspark.sql import Row
-
     spark = df.sparkSession
     label_df = spark.createDataFrame(
         [Row(_row_idx=idx, sentiment_label=lbl) for idx, lbl in enumerate(labels)]
     )
-
-    # Add monotonically increasing row index to original df
     indexed = df.withColumn("_row_idx", F.monotonically_increasing_id())
-
-    # Remap monotonic IDs to 0-based by collecting and reassigning
-    # (monotonically_increasing_id is not guaranteed to be 0-based)
     idx_rows = indexed.select("_row_idx").collect()
     idx_map = {row["_row_idx"]: i for i, row in enumerate(idx_rows)}
-
-    # Build a broadcast-friendly mapping df
     map_df = spark.createDataFrame(
         [Row(_row_idx=orig, _seq=seq) for orig, seq in idx_map.items()]
     )
-
-    result = (
+    return (
         indexed
         .join(map_df, on="_row_idx", how="left")
         .join(label_df.withColumnRenamed("_row_idx", "_seq"), on="_seq", how="left")
         .drop("_row_idx", "_seq")
         .fillna({"sentiment_label": "neutral"})
     )
-    return result
 
 
 # ---------------------------------------------------------------------------
-# Spark Session
+# Spark Session — cloud S3/R2
 # ---------------------------------------------------------------------------
-
 def create_spark_session() -> SparkSession:
-    minio_endpoint = os.getenv("MINIO_ENDPOINT", "minio:9000")
-    if not minio_endpoint.startswith("http"):
-        minio_endpoint = f"http://{minio_endpoint}"
-
-    return (
-        SparkSession.builder.appName("CustomerAnalyticsPipeline")
+    builder = (
+        SparkSession.builder
+        .appName("CustomerAnalyticsPipeline")
+        .master("local[2]")
+        .config("spark.driver.memory", DRIVER_MEMORY)
+        .config("spark.executor.memory", EXECUTOR_MEMORY)
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+        .config(
+            "spark.sql.catalog.spark_catalog",
+            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
+        )
         .config("spark.sql.shuffle.partitions", "4")
-        .config("spark.driver.memory", "2g")
-        .config("spark.jars.packages", "org.postgresql:postgresql:42.7.3,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262,io.delta:delta-spark_2.12:3.1.0")
-        .config("spark.hadoop.fs.s3a.endpoint", minio_endpoint)
-        .config("spark.hadoop.fs.s3a.access.key", os.getenv("MINIO_ACCESS_KEY", "admin"))
-        .config("spark.hadoop.fs.s3a.secret.key", os.getenv("MINIO_SECRET_KEY", "adminpassword"))
-        .config("spark.hadoop.fs.s3a.path.style.access", "true")
-        .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
+        .config(
+            "spark.jars.packages",
+            ",".join([
+                "org.postgresql:postgresql:42.7.3",
+                "org.apache.hadoop:hadoop-aws:3.3.4",
+                "com.amazonaws:aws-java-sdk-bundle:1.12.262",
+                "io.delta:delta-spark_2.12:3.1.0",
+            ]),
+        )
         .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
-        .getOrCreate()
+        .config(
+            "spark.hadoop.fs.s3a.aws.credentials.provider",
+            "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider",
+        )
+        .config("spark.hadoop.fs.s3a.access.key", AWS_KEY)
+        .config("spark.hadoop.fs.s3a.secret.key", AWS_SECRET)
+        .config("spark.hadoop.fs.s3a.path.style.access", "true")
     )
+
+    if S3_ENDPOINT:
+        # Cloudflare R2 or other S3-compatible endpoint
+        builder = (
+            builder
+            .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT)
+            .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "true")
+        )
+    else:
+        # Standard AWS S3
+        builder = builder.config(
+            "spark.hadoop.fs.s3a.endpoint",
+            f"s3.{AWS_REGION}.amazonaws.com",
+        )
+
+    return builder.getOrCreate()
 
 
 # ---------------------------------------------------------------------------
 # Read
 # ---------------------------------------------------------------------------
-
 def read_raw(spark: SparkSession) -> DataFrame:
-    """Read all Parquet files from raw shopee + lazada dirs."""
     dfs = []
-    for platform in ["shopee", "lazada"]:
-        path_pattern = f"s3a://raw-data/{platform}/*.parquet"
+    for platform, path in [("shopee", RAW_SHOPEE_PATH), ("lazada", RAW_LAZADA_PATH)]:
         try:
-            logger.info(f"Reading raw data from MinIO S3: {path_pattern}")
-            df = spark.read.parquet(path_pattern)
+            logger.info(f"Reading raw Parquet from: {path}")
+            df = spark.read.parquet(path)
             dfs.append(df)
-        except Exception as e:
-            logger.warning(f"No parquet files found or accessible for {platform} at {path_pattern}: {e}")
+            logger.info(f"  {platform}: {df.count()} rows")
+        except Exception as exc:
+            logger.warning(f"No Parquet found for {platform}: {exc}")
 
     if not dfs:
         raise FileNotFoundError(
-            f"No raw Parquet files found under {RAW_DIR}. Run scrapers first."
+            f"No raw Parquet files found under s3://{S3_BUCKET}/raw/. "
+            "Run scrapers first or check S3 credentials."
         )
 
-    def union_all(dfs: list) -> DataFrame:
-        all_cols = sorted({c for df in dfs for c in df.columns})
-        aligned = [
-            df.select([
-                F.col(c) if c in df.columns else F.lit(None).cast("string").alias(c)
-                for c in all_cols
-            ])
-            for df in dfs
-        ]
-        return reduce(DataFrame.union, aligned)
-
-    return union_all(dfs)
+    all_cols = sorted({c for df in dfs for c in df.columns})
+    aligned = [
+        df.select([
+            F.col(c) if c in df.columns else F.lit(None).cast("string").alias(c)
+            for c in all_cols
+        ])
+        for df in dfs
+    ]
+    return reduce(DataFrame.union, aligned)
 
 
 # ---------------------------------------------------------------------------
-# Data Quality & Transform
+# Transform & Quality
 # ---------------------------------------------------------------------------
-
 def clean_and_enrich(df: DataFrame) -> DataFrame:
-    """Clean nulls, normalise types, remove empty reviews."""
-    df = (
+    return (
         df
         .withColumn("rating", F.col("rating").cast("int"))
         .withColumn("comment", F.trim(F.col("comment")))
@@ -230,62 +216,50 @@ def clean_and_enrich(df: DataFrame) -> DataFrame:
         .withColumn("year_month", F.date_format(F.col("review_time"), "yyyy-MM"))
         .dropDuplicates(["platform", "item_id", "reviewer_name", "review_time"])
     )
-    return df
+
 
 def check_data_quality(df: DataFrame) -> DataFrame:
-    """
-    Enforce Data Quality by verifying:
-    1. Rating is between 1 and 5
-    2. Comment length > 3
-    3. Item ID is not null
-    Quarantines bad records and returns only good records.
-    """
     quality_cond = (
-        F.col("item_id").isNotNull() &
-        F.col("rating").between(1, 5) &
-        (F.length(F.col("comment")) > 3)
+        F.col("item_id").isNotNull()
+        & F.col("rating").between(1, 5)
+        & (F.length(F.col("comment")) > 3)
     )
-    
-    # Split records
     good_df = df.filter(quality_cond)
-    bad_df = df.filter(~quality_cond)
-    
+    bad_df  = df.filter(~quality_cond)
     bad_count = bad_df.count()
     if bad_count > 0:
-        logger.warning(f"Data Quality Check Failed for {bad_count} records. Moving to Quarantine S3 bucket.")
-        quarantine_path = "s3a://raw-data/quarantine_reviews"
+        logger.warning(f"{bad_count} records failed QC → quarantine: {QUARANTINE_PATH}")
         try:
-            bad_df.write.format("parquet").mode("append").save(quarantine_path)
-            logger.info(f"Quarantined {bad_count} records to {quarantine_path}")
-        except Exception as e:
-            logger.error(f"Failed to write quarantine data: {e}")
-            
+            bad_df.write.format("parquet").mode("append").save(QUARANTINE_PATH)
+        except Exception as exc:
+            logger.error(f"Quarantine write failed: {exc}")
     return good_df
 
 
 # ---------------------------------------------------------------------------
-# Write Processed Parquet
+# Write Delta + JDBC
 # ---------------------------------------------------------------------------
-
 def write_processed(df: DataFrame) -> str:
-    out = "s3a://raw-data/processed_delta"
-    logger.info(f"Writing processed Delta tables to MinIO -> {out}")
-    df.write.format("delta").mode("overwrite").partitionBy("platform", "year_month").save(out)
-    return out
+    logger.info(f"Writing Delta Lake → {DELTA_OUT_PATH}")
+    (
+        df.write.format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .partitionBy("platform", "year_month")
+        .save(DELTA_OUT_PATH)
+    )
+    logger.info("Delta write complete.")
+    return DELTA_OUT_PATH
 
-
-# ---------------------------------------------------------------------------
-# Load into PostgreSQL (staging layer)
-# ---------------------------------------------------------------------------
 
 def load_to_postgres(df: DataFrame) -> None:
-    logger.info("Loading data into PostgreSQL staging.reviews ...")
+    logger.info(f"JDBC load → {POSTGRES_HOST}/{POSTGRES_DB} :: staging.reviews")
     (
         df.write.format("jdbc")
-        .option("url", settings.postgres_jdbc_url)
+        .option("url", JDBC_URL)
         .option("dbtable", "staging.reviews")
-        .option("user", settings.POSTGRES_USER)
-        .option("password", settings.POSTGRES_PASSWORD)
+        .option("user", POSTGRES_USER)
+        .option("password", POSTGRES_PASS)
         .option("driver", JDBC_DRIVER)
         .option("batchsize", 1000)
         .mode("append")
@@ -297,35 +271,29 @@ def load_to_postgres(df: DataFrame) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-
 def run_pipeline():
-    logger.add(
-        PROJECT_ROOT / settings.LOGS_DIR / "spark_{time}.log",
-        rotation="50 MB",
-        level="INFO",
-    )
-    logger.info("Starting Spark pipeline...")
+    logger.add(sys.stdout, level="INFO", colorize=False)
+    logger.info("=" * 60)
+    logger.info("Customer Analytics Spark Pipeline — Cloud S3 Mode")
+    logger.info(f"  Bucket   : {S3_BUCKET}")
+    logger.info(f"  Endpoint : {S3_ENDPOINT or 'AWS default'}")
+    logger.info(f"  Postgres : {POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}")
+    logger.info("=" * 60)
 
     spark = create_spark_session()
     spark.sparkContext.setLogLevel("WARN")
 
-    raw_df = read_raw(spark)
-    logger.info(f"Raw rows: {raw_df.count()}")
-
-    cleaned_df = clean_and_enrich(raw_df)
-    
-    # Apply Data Quality Constraints
+    raw_df       = read_raw(spark)
+    cleaned_df   = clean_and_enrich(raw_df)
     validated_df = check_data_quality(cleaned_df)
-    logger.info(f"Validated clean rows: {validated_df.count()}")
+    logger.info(f"Clean rows after QC: {validated_df.count()}")
 
-    # Gemini sentiment labeling (driver-side batching)
     labeled_df = label_sentiment_with_gemini(validated_df)
-
     write_processed(labeled_df)
     load_to_postgres(labeled_df)
 
     spark.stop()
-    logger.success("Pipeline complete.")
+    logger.success("Pipeline complete ✓")
 
 
 if __name__ == "__main__":

@@ -4,12 +4,17 @@ Bypasses Datadome anti-bot checks by using a real browser window.
 
 Target: Skincare products on Shopee VN (Health & Beauty > Skincare)
 
+Cloud/GHA mode:
+  Set CI=true in environment to enable headless mode + GHA Chrome flags.
+  Set PROXY_HOST/PROXY_PORT/PROXY_USER/PROXY_PASS for residential proxy.
+
 Schema fields per review:
     platform, brand, item_id (auto-incremented), product_name,
     skin_type, total_like, formula, time_delivery,
     rating, comment, reviewer_name, review_time
 """
 
+import os
 import time
 import re
 import json
@@ -19,8 +24,26 @@ from pathlib import Path
 from datetime import datetime
 from itertools import count as auto_counter
 
-# Bypass macOS SSL certificate verification for undetected_chromedriver downloads
-ssl._create_default_https_context = ssl._create_unverified_context
+# On macOS (local dev) bypass SSL verification for uc driver downloads.
+# On GHA (Linux) this is a no-op.
+if ssl.OPENSSL_VERSION.startswith("OpenSSL") and os.name == "posix" and not os.environ.get("CI"):
+    ssl._create_default_https_context = ssl._create_unverified_context
+
+# ── Cloud / GHA detection ─────────────────────────────────────────────────────
+IS_CI = os.environ.get("CI", "").lower() in ("true", "1", "yes")
+
+# ── Proxy config (Webshare.io free tier or any SOCKS5/HTTP proxy) ─────────────
+PROXY_HOST = os.environ.get("PROXY_HOST", "")
+PROXY_PORT = os.environ.get("PROXY_PORT", "")
+PROXY_USER = os.environ.get("PROXY_USER", "")
+PROXY_PASS = os.environ.get("PROXY_PASS", "")
+
+# ── S3 / R2 upload config ─────────────────────────────────────────────────────
+S3_BUCKET       = os.environ.get("S3_BUCKET", "")
+S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL", "")
+AWS_ACCESS_KEY  = os.environ.get("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_KEY  = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+AWS_REGION      = os.environ.get("AWS_REGION", "auto")
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -115,11 +138,54 @@ class ShopeeScraper:
 
     def init_driver(self):
         options = uc.ChromeOptions()
-        options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1280,1024")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        self.driver = uc.Chrome(options=options, version_main=146)
+
+        # ── Mandatory GHA / headless flags ────────────────────────────────────
+        if IS_CI:
+            options.add_argument("--headless=new")       # Chrome 112+ headless
+            options.add_argument("--no-sandbox")          # required in container
+            options.add_argument("--disable-dev-shm-usage")  # avoids /dev/shm OOM
+            options.add_argument("--disable-gpu")
+            options.add_argument("--window-size=1280,1024")
+            options.add_argument("--disable-extensions")
+            options.add_argument("--disable-setuid-sandbox")
+            options.add_argument("--remote-debugging-port=9222")
+        else:
+            # Local dev — visible browser for debugging
+            options.add_argument("--disable-gpu")
+            options.add_argument("--window-size=1280,1024")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+
+        # ── Proxy injection (Webshare.io / any HTTP proxy) ────────────────────
+        if PROXY_HOST and PROXY_PORT:
+            if PROXY_USER and PROXY_PASS:
+                # Authenticated proxy — inject via Chrome extension approach
+                proxy_arg = f"--proxy-server=http://{PROXY_HOST}:{PROXY_PORT}"
+                options.add_argument(proxy_arg)
+                # Selenium wire or Playwright needed for authenticated proxies;
+                # for simplicity we use env-var credentials via CDP later.
+                logger.info(f"[Shopee] Using proxy: {PROXY_HOST}:{PROXY_PORT}")
+            else:
+                options.add_argument(f"--proxy-server=http://{PROXY_HOST}:{PROXY_PORT}")
+                logger.info(f"[Shopee] Using unauthenticated proxy: {PROXY_HOST}:{PROXY_PORT}")
+
+        # version_main=None → auto-detect installed Chrome version on runner
+        chrome_version = None if IS_CI else 146
+        self.driver = uc.Chrome(options=options, version_main=chrome_version)
+
+        # Authenticate proxy via CDP (needed for user:pass proxies in headless)
+        if IS_CI and PROXY_HOST and PROXY_USER and PROXY_PASS:
+            self.driver.execute_cdp_cmd(
+                "Network.enable", {}
+            )
+            self.driver.execute_cdp_cmd(
+                "Network.setExtraHTTPHeaders",
+                {"headers": {
+                    "Proxy-Authorization": __import__('base64').b64encode(
+                        f"{PROXY_USER}:{PROXY_PASS}".encode()
+                    ).decode()
+                }}
+            )
 
     def _close_modals(self):
         """Forcefully remove Shopee blocking login popups/overlays via JS."""
@@ -495,4 +561,44 @@ class ShopeeScraper:
                     review_time_val = datetime.utcnow()
                     ts = r_data.get('ts', '')
                     if ts:
-      
+                        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%d/%m/%Y", "%Y-%m-%d"):
+                            try:
+                                review_time_val = datetime.strptime(ts[:16], fmt[:len(ts[:16])])
+                                break
+                            except Exception:
+                                continue
+
+                    reviews.append({
+                        "platform":      "shopee",
+                        "brand":         page_brand,
+                        "item_id":       surrogate_id,
+                        "product_name":  product_name,
+                        "skin_type":     skin_type,
+                        "total_like":    total_like,
+                        "formula":       formula,
+                        "time_delivery": time_delivery,
+                        "price":         price,
+                        "flash_sale":    flash_sale,
+                        "rating":        int(r_data.get('rating') or 0),
+                        "comment":       r_data.get('comment', ''),
+                        "reviewer_name": r_data.get('reviewer_name', 'anonymous'),
+                        "review_time":   review_time_val,
+                    })
+            except Exception as exc:
+                logger.warning(f"[Shopee] Review JS execution error: {exc}")
+
+            # ── Paginate reviews ─────────────────────────────────────────────
+            paginated = False
+            for next_sel in [
+                "button.shopee-icon-button--right",
+                "button[aria-label='Next']",
+                ".shopee-page-controller button:last-child",
+                "li.ant-pagination-next button",
+            ]:
+                try:
+                    next_btn = self.driver.find_element(By.CSS_SELECTOR, next_sel)
+                    if not next_btn.is_enabled():
+                        break
+                    self.driver.execute_script("arguments[0].click();", next_btn)
+                    time.sleep(2.5)
+                    self._close_modals()

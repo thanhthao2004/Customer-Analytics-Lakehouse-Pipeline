@@ -1,30 +1,40 @@
 """
-Pipeline Control Center — FastAPI Backend
-Runs on Ubuntu VM port 8000. Acts as the unified REST controller
-for all Lakehouse pipeline services (Airflow, MinIO, Postgres, Spark, dbt).
+Pipeline Control Center — FastAPI Backend (Cloud Edition)
+Runs on Railway / Fly.io. Replaces Airflow + MinIO with:
+  - GitHub Actions  (scheduling + orchestration)
+  - Cloudflare R2 / AWS S3 (storage)
+  - Railway PostgreSQL (database)
+
+Env vars (set as Railway service variables or GitHub Secrets):
+  DB_DSN, POSTGRES_HOST/PORT/USER/PASSWORD/DB
+  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET,
+  S3_ENDPOINT_URL, AWS_REGION
+  GH_TOKEN, GH_REPO  (for pipeline status from GitHub API)
+  STATUS_GIST_ID     (optional — Gist written by notify job)
 """
 
 import os
+import json
 import subprocess
 import asyncio
-from datetime import datetime
+import urllib.request
+from datetime import datetime, timezone
 from typing import AsyncGenerator
 
 import httpx
 import psycopg2
 from boto3 import client as boto3_client
 from botocore.config import Config
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 app = FastAPI(
     title="Customer Analytics Lakehouse — Pipeline Control Center",
-    description="Unified API to monitor and trigger all pipeline stages.",
-    version="1.0.0",
+    description="Cloud-native REST API for monitoring and triggering the GHA-based pipeline.",
+    version="2.0.0",
 )
 
-# Allow the static frontend (any origin) to call this API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,30 +42,53 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Config ────────────────────────────────────────────────────────────────────
-AIRFLOW_URL    = os.getenv("AIRFLOW_URL",    "http://airflow-webserver:8080")
-AIRFLOW_USER   = os.getenv("AIRFLOW_USER",   "admin")
-AIRFLOW_PASS   = os.getenv("AIRFLOW_PASS",   "adminpassword")
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")
-MINIO_ACCESS   = os.getenv("MINIO_ACCESS_KEY", "admin")
-MINIO_SECRET   = os.getenv("MINIO_SECRET_KEY", "adminpassword")
-PG_DSN         = os.getenv(
-    "DB_DSN",
-    "host=postgres port=5432 dbname=customer_analytics user=analytics password=analytics123",
+# ── Config ─────────────────────────────────────────────────────────────────────
+# Storage (Cloudflare R2 or AWS S3)
+S3_BUCKET       = os.getenv("S3_BUCKET", "")
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL", "")
+AWS_ACCESS_KEY  = os.getenv("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_KEY  = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+AWS_REGION      = os.getenv("AWS_REGION", "auto")
+
+# PostgreSQL (Railway)
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
+POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "analytics")
+POSTGRES_PASS = os.getenv("POSTGRES_PASSWORD", "")
+POSTGRES_DB   = os.getenv("POSTGRES_DB", "customer_analytics")
+PG_DSN = (
+    os.getenv("DB_DSN")
+    or f"host={POSTGRES_HOST} port={POSTGRES_PORT} dbname={POSTGRES_DB} "
+       f"user={POSTGRES_USER} password={POSTGRES_PASS}"
 )
-APP_ROOT = "/opt/app"   # mounted project root inside Docker
+
+# GitHub (for triggering workflow_dispatch + reading run status)
+GH_TOKEN = os.getenv("GH_TOKEN", "")
+GH_REPO  = os.getenv("GH_REPO", "")          # e.g. "octocat/my-repo"
+
+# Pipeline status Gist (written by the notify job)
+STATUS_GIST_ID = os.getenv("STATUS_GIST_ID", "")
+
+# Working directory inside the container
+APP_ROOT = "/opt/app"
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _s3_client():
+    """Return a boto3 S3 client pointing at R2 or AWS."""
     return boto3_client(
         "s3",
-        endpoint_url=f"http://{MINIO_ENDPOINT}",
-        aws_access_key_id=MINIO_ACCESS,
-        aws_secret_access_key=MINIO_SECRET,
+        endpoint_url=S3_ENDPOINT_URL or None,
+        aws_access_key_id=AWS_ACCESS_KEY,
+        aws_secret_access_key=AWS_SECRET_KEY,
+        region_name=AWS_REGION,
         config=Config(signature_version="s3v4"),
-        region_name="us-east-1",
     )
+
+
+def _pg_connect():
+    return psycopg2.connect(PG_DSN)
 
 
 def _run(cmd: list[str]) -> dict:
@@ -72,7 +105,7 @@ def _run(cmd: list[str]) -> dict:
 
 
 async def _stream_cmd(cmd: list[str]) -> AsyncGenerator[str, None]:
-    """Async generator that streams subprocess stdout line by line (for SSE)."""
+    """Async generator that streams subprocess stdout line by line (SSE)."""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -86,57 +119,100 @@ async def _stream_cmd(cmd: list[str]) -> AsyncGenerator[str, None]:
     yield f"data: [EXIT:{proc.returncode}]\n\n"
 
 
+def _gh_api(path: str, method: str = "GET", body: dict | None = None) -> dict:
+    """Call the GitHub REST API with the GH_TOKEN."""
+    url = f"https://api.github.com{path}"
+    data = json.dumps(body).encode() if body else None
+    req  = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"Bearer {GH_TOKEN}")
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("X-GitHub-Api-Version", "2022-11-28")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 # ── Status ────────────────────────────────────────────────────────────────────
 
-@app.get("/status", summary="Health check for all services")
+@app.get("/status", summary="Health check for all cloud services")
 async def get_status():
-    services = {}
-
-    # Airflow
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(
-                f"{AIRFLOW_URL}/api/v1/health",
-                auth=(AIRFLOW_USER, AIRFLOW_PASS),
-            )
-        services["airflow"] = "ok" if r.status_code == 200 else "degraded"
-    except Exception:
-        services["airflow"] = "offline"
-
-    # MinIO
-    try:
-        _s3_client().list_buckets()
-        services["minio"] = "ok"
-    except Exception:
-        services["minio"] = "offline"
+    services: dict = {}
 
     # PostgreSQL
     try:
-        conn = psycopg2.connect(PG_DSN)
+        conn = _pg_connect()
         conn.close()
         services["postgres"] = "ok"
     except Exception:
         services["postgres"] = "offline"
 
-    # Self
-    services["api"] = "ok"
-    services["timestamp"] = datetime.utcnow().isoformat()
+    # S3 / R2
+    try:
+        _s3_client().list_buckets()
+        services["s3"] = "ok"
+    except Exception:
+        services["s3"] = "offline"
+
+    # GitHub Actions — last workflow run status
+    if GH_TOKEN and GH_REPO:
+        runs = _gh_api(
+            f"/repos/{GH_REPO}/actions/workflows/lakehouse_pipeline.yml/runs?per_page=1"
+        )
+        run_list = runs.get("workflow_runs", [])
+        if run_list:
+            latest = run_list[0]
+            services["last_pipeline_run"] = latest.get("conclusion") or latest.get("status")
+            services["last_run_url"]      = latest.get("html_url")
+        else:
+            services["last_pipeline_run"] = "no_runs"
+    else:
+        services["last_pipeline_run"] = "gh_token_not_configured"
+
+    # Pipeline status from Gist (written by notify job)
+    if STATUS_GIST_ID and GH_TOKEN:
+        gist = _gh_api(f"/gists/{STATUS_GIST_ID}")
+        files = gist.get("files", {})
+        if "pipeline_status.json" in files:
+            raw = files["pipeline_status.json"].get("content", "{}")
+            try:
+                services["pipeline_status"] = json.loads(raw)
+            except Exception:
+                pass
+
+    services["api"]       = "ok"
+    services["timestamp"] = datetime.now(timezone.utc).isoformat()
     return services
 
 
-# ── Pipeline Triggers ─────────────────────────────────────────────────────────
+# ── Pipeline Triggers (GHA workflow_dispatch) ─────────────────────────────────
 
-@app.post("/pipeline/upload", summary="Upload raw Parquet files to MinIO")
-def trigger_upload():
-    return _run(["python3", "src/ingestion/upload_to_minio.py"])
+@app.post("/pipeline/trigger", summary="Trigger the full GHA Lakehouse pipeline")
+async def trigger_pipeline(run_full: bool = True):
+    """Dispatches a workflow_dispatch event on the lakehouse_pipeline workflow."""
+    if not GH_TOKEN or not GH_REPO:
+        raise HTTPException(503, "GH_TOKEN and GH_REPO must be set to trigger pipelines.")
+    result = _gh_api(
+        f"/repos/{GH_REPO}/actions/workflows/lakehouse_pipeline.yml/dispatches",
+        method="POST",
+        body={
+            "ref": "main",
+            "inputs": {"run_full_pipeline": str(run_full).lower()},
+        },
+    )
+    if "error" in result:
+        raise HTTPException(500, detail=result["error"])
+    return {"status": "dispatched", "repo": GH_REPO, "run_full_pipeline": run_full}
 
 
-@app.post("/pipeline/spark", summary="Submit PySpark processing job")
+@app.post("/pipeline/spark", summary="Run PySpark pipeline (in-container, for local dev)")
 def trigger_spark():
-    return _run(["spark-submit", "src/processing/spark_pipeline.py"])
+    return _run(["python3", "src/processing/spark_pipeline.py"])
 
 
-@app.post("/pipeline/dbt", summary="Run dbt transformations")
+@app.post("/pipeline/dbt", summary="Run dbt transformations (in-container)")
 def trigger_dbt():
     return _run([
         "bash", "-c",
@@ -144,13 +220,13 @@ def trigger_dbt():
     ])
 
 
-@app.post("/pipeline/run-all", summary="Run the full pipeline (upload → spark → dbt)")
+@app.post("/pipeline/run-all", summary="Run full pipeline in-container (spark → dbt)")
 def trigger_all():
     results = {}
     for label, cmd in [
-        ("upload", ["python3", "src/ingestion/upload_to_minio.py"]),
-        ("spark",  ["spark-submit", "src/processing/spark_pipeline.py"]),
-        ("dbt",    ["bash", "-c", "cd dbt && dbt deps --profiles-dir . && dbt run --profiles-dir . && dbt test --profiles-dir ."]),
+        ("spark", ["python3", "src/processing/spark_pipeline.py"]),
+        ("dbt",   ["bash", "-c",
+                   "cd dbt && dbt deps --profiles-dir . && dbt run --profiles-dir . && dbt test --profiles-dir ."]),
     ]:
         result = _run(cmd)
         results[label] = result
@@ -160,12 +236,12 @@ def trigger_all():
     return results
 
 
-# ── Log Streaming (Server-Sent Events) ────────────────────────────────────────
+# ── Log Streaming (SSE) ───────────────────────────────────────────────────────
 
 @app.get("/logs/stream/spark", summary="Stream Spark job logs live")
 async def stream_spark_logs():
     return StreamingResponse(
-        _stream_cmd(["spark-submit", "src/processing/spark_pipeline.py"]),
+        _stream_cmd(["python3", "src/processing/spark_pipeline.py"]),
         media_type="text/event-stream",
     )
 
@@ -178,56 +254,40 @@ async def stream_dbt_logs():
     )
 
 
-# ── Airflow DAG Status ────────────────────────────────────────────────────────
+# ── GitHub Actions Run Status ─────────────────────────────────────────────────
 
-@app.get("/airflow/dag-status", summary="Latest DAG run status")
-async def airflow_dag_status():
-    dag_id = "customer_lakehouse_pipeline"
+@app.get("/github/runs", summary="Latest GHA pipeline run status")
+async def github_run_status():
+    if not GH_TOKEN or not GH_REPO:
+        return {"error": "GH_TOKEN and GH_REPO not configured"}
+    data = _gh_api(
+        f"/repos/{GH_REPO}/actions/workflows/lakehouse_pipeline.yml/runs?per_page=5"
+    )
+    runs = data.get("workflow_runs", [])
+    return {
+        "runs": [
+            {
+                "run_id":     r.get("id"),
+                "status":     r.get("status"),
+                "conclusion": r.get("conclusion"),
+                "started_at": r.get("run_started_at"),
+                "url":        r.get("html_url"),
+                "branch":     r.get("head_branch"),
+                "trigger":    r.get("event"),
+            }
+            for r in runs
+        ]
+    }
+
+
+# ── S3 / R2 Storage Info ──────────────────────────────────────────────────────
+
+@app.get("/storage/buckets", summary="List R2/S3 bucket contents summary")
+def storage_buckets():
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                f"{AIRFLOW_URL}/api/v1/dags/{dag_id}/dagRuns?limit=1&order_by=-execution_date",
-                auth=(AIRFLOW_USER, AIRFLOW_PASS),
-            )
-        data = r.json()
-        runs = data.get("dag_runs", [])
-        if not runs:
-            return {"status": "no_runs", "dag_id": dag_id}
-        latest = runs[0]
-        return {
-            "dag_id": dag_id,
-            "status": latest.get("state"),
-            "run_id": latest.get("dag_run_id"),
-            "start_date": latest.get("start_date"),
-            "end_date": latest.get("end_date"),
-        }
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
-
-
-@app.post("/airflow/trigger", summary="Manually trigger the Airflow DAG")
-async def trigger_dag():
-    dag_id = "customer_lakehouse_pipeline"
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(
-                f"{AIRFLOW_URL}/api/v1/dags/{dag_id}/dagRuns",
-                auth=(AIRFLOW_USER, AIRFLOW_PASS),
-                json={"conf": {}},
-            )
-        return r.json()
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
-
-
-# ── MinIO Bucket Info ─────────────────────────────────────────────────────────
-
-@app.get("/minio/buckets", summary="List MinIO bucket contents summary")
-def minio_buckets():
-    try:
-        s3 = _s3_client()
+        s3      = _s3_client()
         buckets = s3.list_buckets().get("Buckets", [])
-        result = []
+        result  = []
         for bucket in buckets:
             name = bucket["Name"]
             try:
@@ -249,10 +309,9 @@ def minio_buckets():
 @app.get("/postgres/metrics", summary="Row counts and sentiment summary from PostgreSQL")
 def postgres_metrics():
     try:
-        conn = psycopg2.connect(PG_DSN)
-        cur = conn.cursor()
-
-        metrics = {}
+        conn = _pg_connect()
+        cur  = conn.cursor()
+        metrics: dict = {}
 
         cur.execute("SELECT COUNT(*) FROM staging.reviews")
         metrics["staging_total_rows"] = cur.fetchone()[0]

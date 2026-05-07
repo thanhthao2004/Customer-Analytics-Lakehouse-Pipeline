@@ -1,0 +1,27 @@
+# Metabase — Railway Deployment
+# Deploy the official Metabase image to Railway, backed by your Railway PostgreSQL.
+# Steps:
+#   1. In Railway dashboard → New Service → Docker Image → metabase/metabase:latest
+#   2. Add the environment variables below as Railway service variables.
+#   3. Railway will auto-assign a public URL (e.g. https://metabase-xxxx.up.railway.app).
+#
+# NOTE: Metabase uses its OWN internal DB (MB_DB_*) to store dashboards/users.
+#       For free tier, point it at a SEPARATE Railway PostgreSQL database
+#       (not the same one used by the analytics pipeline).
+
+services:
+  metabase:
+    image: metabase/metabase:latest
+    # Railway environment variables (set in the Railway UI → Service → Variables):
+    environment:
+      MB_DB_TYPE: postgres
+      # Use your Railway PostgreSQL PUBLIC URL (Settings → Database → Connect):
+      MB_DB_HOST:   "${METABASE_DB_HOST}"
+      MB_DB_PORT:   "${METABASE_DB_PORT}"
+      MB_DB_USER:   "${METABASE_DB_USER}"
+      MB_DB_PASS:   "${METABASE_DB_PASS}"
+      MB_DB_DBNAME: "${METABASE_DB_DBNAME}"
+      # Optional: set site URL for email links
+      MB_SITE_URL:  "${RAILWAY_PUBLIC_DOMAIN}"
+    ports:
+      - "3000:3000"

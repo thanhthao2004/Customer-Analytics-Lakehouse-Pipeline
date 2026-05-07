@@ -18,3 +18,9 @@ dbt/dbt_packages/
 dbt/logs/
 .DS_Store
 *.parquet
+
+# Secret/credential files — NEVER commit these
+env.txt
+*.env
+secrets.txt
+credentials.txt
