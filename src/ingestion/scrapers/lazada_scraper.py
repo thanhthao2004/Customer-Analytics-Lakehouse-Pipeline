@@ -147,10 +147,11 @@ def _make_session() -> requests.Session:
 
     session.proxies.update(proxies)
     session.headers.update({
-        "User-Agent":      random.choice(USER_AGENTS),
-        "Accept":          "application/json, text/plain, */*",
-        "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8",
-        "Referer":         "https://www.lazada.vn/",
+        "User-Agent":        random.choice(USER_AGENTS),
+        "Accept":            "application/json, text/plain, */*",
+        "Accept-Language":   "vi-VN,vi;q=0.9,en-US;q=0.8",
+        "Referer":           "https://www.lazada.vn/",
+        "x-requested-with": "XMLHttpRequest",   # required for Lazada AJAX endpoints
     })
     return session
 
@@ -225,13 +226,15 @@ def _api_get_reviews(
     page_size: int = 50,
 ) -> list[dict]:
     """
-    Fetch reviews via Lazada's public review API.
-    No login required.
+    Fetch reviews via Lazada VN's public review API. No login required.
 
-    API: GET https://my.lazada.vn/pdp/review/getReviewList
-         params: itemId, pageSize, pageNo, filter, sort
+    Uses www.lazada.vn (Vietnam), NOT my.lazada.vn (Malaysia).
+    Tries two endpoint variants; guards against non-JSON (HTML) responses.
     """
-    url    = "https://my.lazada.vn/pdp/review/getReviewList"
+    endpoints = [
+        "https://www.lazada.vn/pdp/review/getReviewList",
+        "https://www.lazada.vn/review/product-reviews/getReviewList",
+    ]
     params = {
         "itemId":   item_id,
         "pageSize": page_size,
@@ -239,23 +242,38 @@ def _api_get_reviews(
         "filter":   0,
         "sort":     0,
     }
-    try:
-        resp = session.get(url, params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+    for url in endpoints:
+        try:
+            resp = session.get(url, params=params, timeout=15)
+            resp.raise_for_status()
 
-        # Navigate the response structure
-        reviews = (
-            data.get("model", {}).get("items")
-            or data.get("data", {}).get("reviews")
-            or data.get("reviews")
-            or []
-        )
-        return reviews
+            # Guard: try JSON parse regardless of content-type
+            try:
+                data = resp.json()
+            except Exception:
+                logger.debug(
+                    f"[Lazada] Non-JSON from {url} for item {item_id} "
+                    f"(preview: {resp.text[:120]})"
+                )
+                continue
 
-    except Exception as exc:
-        logger.warning(f"[Lazada API] Reviews failed for item {item_id}: {exc}")
-        return []
+            reviews = (
+                data.get("model", {}).get("items")
+                or data.get("data", {}).get("reviews")
+                or data.get("result", {}).get("reviews")
+                or data.get("reviews")
+                or []
+            )
+            if reviews:
+                return reviews
+
+        except Exception as exc:
+            logger.debug(f"[Lazada] {url} failed for item {item_id}: {exc}")
+            continue
+
+    logger.warning(f"[Lazada] No reviews for item {item_id} (all endpoints failed)")
+    return []
+
 
 
 # ── Main scraper class ────────────────────────────────────────────────────────

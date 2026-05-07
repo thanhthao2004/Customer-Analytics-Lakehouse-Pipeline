@@ -114,7 +114,7 @@ jobs:
           PROXY_HOST:            ${{ secrets.PROXY_HOST }}
           PROXY_PORT:            ${{ secrets.PROXY_PORT }}
           PROXY_USER:            ${{ secrets.PROXY_USER }}
-          PROXY_PASS:            ${{ secrets.PROXY_PASS }}
+          PROXY_PASS:            ${{ secrets.PROXwwY_PASS }}
         run: |
           python src/ingestion/scrapers/shopee_scraper.py
           # Count output rows

@@ -171,43 +171,83 @@ def _make_session() -> requests.Session:
 
 def _api_search_products(session: requests.Session, brand: str, limit: int = 20) -> list[dict]:
     """
-    Search Shopee for products matching '{brand} skincare'.
-    Returns list of {item_id, shop_id, product_name} dicts.
+    Search Shopee using the HTML search page and parse __NEXT_DATA__ JSON.
+    No cookies or auth required.
 
-    API: GET https://shopee.vn/api/v4/search/search_items
-    No authentication required for search results.
+    Shopee embeds all search results as JSON in a <script id="__NEXT_DATA__"> tag.
+    This avoids the 403 on the API endpoint which requires session cookies.
     """
-    url    = "https://shopee.vn/api/v4/search/search_items"
-    params = {
-        "by":              "relevancy",
-        "keyword":         f"{brand} skincare",
-        "limit":           limit,
-        "newest":          0,
-        "order":           "desc",
-        "page_type":       "search",
-        "scenario":        "PAGE_GLOBAL_SEARCH",
-        "version":         2,
-    }
+    url    = "https://shopee.vn/search"
+    params = {"keyword": f"{brand} skincare"}
+
     try:
-        resp = session.get(url, params=params, timeout=15)
+        resp = session.get(url, params=params, timeout=20)
         resp.raise_for_status()
-        data  = resp.json()
-        items = data.get("items") or data.get("data", {}).get("items") or []
+        html = resp.text
+
+        # Extract __NEXT_DATA__ JSON block
+        match = re.search(
+            r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+            html, re.DOTALL
+        )
+        if not match:
+            # Fallback: find any JSON blob containing itemid+shopid pairs
+            ids = re.findall(r'"itemid":(\d+)', html)
+            sids = re.findall(r'"shopid":(\d+)', html)
+            names = re.findall(r'"name":"([^"]{5,80})"', html)
+            products = []
+            for i, (iid, sid) in enumerate(zip(ids[:limit], sids[:limit])):
+                products.append({
+                    "item_id":      iid,
+                    "shop_id":      sid,
+                    "product_name": names[i] if i < len(names) else f"Shopee Product {iid}",
+                    "brand":        brand,
+                })
+            logger.info(f"[Shopee] {brand}: found {len(products)} products (fallback regex)")
+            return products
+
+        next_data = json.loads(match.group(1))
+
+        # Navigate the __NEXT_DATA__ tree: props.pageProps.initialState.shopee.listingData.items
+        # or props.pageProps.data.sections[0].data.item
+        items = []
+        try:
+            items = (
+                next_data["props"]["pageProps"]["initialState"]["shopee"]["listingData"]["items"]
+            )
+        except (KeyError, TypeError):
+            pass
+
+        if not items:
+            # Try alternate path
+            raw = json.dumps(next_data)
+            ids   = re.findall(r'"itemid":(\d+)', raw)
+            sids  = re.findall(r'"shopid":(\d+)', raw)
+            names = re.findall(r'"name":"([^"]{5,80})"', raw)
+            for i, (iid, sid) in enumerate(zip(ids[:limit], sids[:limit])):
+                items.append({"item_basic": {
+                    "itemid": int(iid),
+                    "shopid": int(sid),
+                    "name":   names[i] if i < len(names) else f"Shopee Product {iid}",
+                }})
+
         products = []
-        for item in items:
-            info = item.get("item_basic") or item
-            item_id = info.get("itemid") or info.get("item_id")
-            shop_id = info.get("shopid")  or info.get("shop_id")
+        for item in items[:limit]:
+            info    = item.get("item_basic") or item
+            item_id = str(info.get("itemid") or info.get("item_id") or "")
+            shop_id = str(info.get("shopid") or info.get("shop_id") or "")
             name    = info.get("name", f"Shopee Product {item_id}")
             if item_id and shop_id:
                 products.append({
-                    "item_id":      str(item_id),
-                    "shop_id":      str(shop_id),
+                    "item_id":      item_id,
+                    "shop_id":      shop_id,
                     "product_name": name,
                     "brand":        brand,
                 })
-        logger.info(f"[Shopee API] {brand}: found {len(products)} products")
+
+        logger.info(f"[Shopee] {brand}: found {len(products)} products")
         return products
+
     except Exception as exc:
         logger.warning(f"[Shopee API] Search failed for '{brand}': {exc}")
         return []
