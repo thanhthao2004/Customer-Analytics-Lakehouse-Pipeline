@@ -1,30 +1,16 @@
 """
-Shopee VN Review Scraper — API-first, no login required.
-
+Shopee VN Scraper — Login & Cookie Support
 Strategy:
-  1. Product discovery: Shopee search API (JSON, no browser needed)
-  2. Review fetching:   Shopee ratings API (JSON, no login needed)
-  3. Selenium fallback: only if API returns empty results
-
-Shopee APIs used (undocumented but stable):
-  Search:  GET /api/v4/search/search_items?keyword=...&limit=...
-  Reviews: GET /api/v2/item/get_ratings?itemid=...&shopid=...&limit=50&offset=...
-
-Anti-ban:
-  - User-agent rotation
-  - Request timing jitter
-  - Residential proxy support (PROXY_* env vars)
-
-GHA: CI=true → headless Chrome (Selenium fallback path only)
+  1. Use SHOPEE_COOKIE if available (Most reliable).
+  2. If not, use SHOPEE_USER/PASS with Selenium to log in and get cookies.
+  3. Use the session/cookies to fetch data via API (Fastest).
 """
 
 import os
 import re
-import ssl
 import json
 import random
 import time
-import urllib.parse
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -32,361 +18,191 @@ import requests
 import pyarrow as pa
 import pyarrow.parquet as pq
 from loguru import logger
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
-# ── GHA / Cloud detection ──────────────────────────────────────────────────────
+# ── Env Config ──────────────────────────────────────────────────────────────
 IS_CI = os.environ.get("CI", "").lower() in ("true", "1", "yes")
 
-if not IS_CI and ssl.OPENSSL_VERSION.startswith("OpenSSL") and os.name == "posix":
-    ssl._create_default_https_context = ssl._create_unverified_context
+# Credentials & Cookies
+SHOPEE_COOKIE = os.environ.get("SHOPEE_COOKIE", "")
+SHOPEE_USER   = os.environ.get("SHOPEE_USER", "")
+SHOPEE_PASS   = os.environ.get("SHOPEE_PASS", "")
 
-# ── Credentials (NOT used for API calls — only kept for Selenium fallback) ─────
-# Shopee's review API does not require login. No credentials needed.
-SHOPEE_USER = os.environ.get("SHOPEE_USER", "")   # optional, for future use
-SHOPEE_PASS = os.environ.get("SHOPEE_PASS", "")   # optional, for future use
-
-# ── Proxy ──────────────────────────────────────────────────────────────────────
 PROXY_HOST = os.environ.get("PROXY_HOST", "")
 PROXY_PORT = os.environ.get("PROXY_PORT", "")
 PROXY_USER = os.environ.get("PROXY_USER", "")
 PROXY_PASS = os.environ.get("PROXY_PASS", "")
 
-# ── S3 / R2 ────────────────────────────────────────────────────────────────────
 S3_BUCKET       = os.environ.get("S3_BUCKET", "")
 S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL", "")
 AWS_ACCESS_KEY  = os.environ.get("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_KEY  = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
 AWS_REGION      = os.environ.get("AWS_REGION", "auto")
 
-# ── Crawl targets ──────────────────────────────────────────────────────────────
-TARGET_BRANDS = [
-    "CeraVe", "La Roche-Posay", "Innisfree", "The Ordinary",
-    "Bioderma", "Hada Labo", "Klairs", "Anessa", "Senka", "Neutrogena",
-]
-PRODUCTS_PER_BRAND      = 10
+TARGET_BRANDS = ["CeraVe", "La Roche-Posay", "Innisfree", "The Ordinary", "Bioderma", "Hada Labo", "Klairs", "Anessa", "Senka", "Neutrogena"]
+PRODUCTS_PER_BRAND = 10
 MAX_REVIEWS_PER_PRODUCT = 50
-PRODUCT_TIMEOUT_S       = 45
-BETWEEN_PRODUCTS_S      = (1.5, 3.0)
 
-# ── Anti-ban headers ──────────────────────────────────────────────────────────
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 ]
 
 SHOPEE_SCHEMA = pa.schema([
-    pa.field("platform",      pa.string()),
-    pa.field("brand",         pa.string()),
-    pa.field("item_id",       pa.int64()),
-    pa.field("product_name",  pa.string()),
-    pa.field("skin_type",     pa.string()),
-    pa.field("total_like",    pa.int32()),
-    pa.field("formula",       pa.string()),
-    pa.field("time_delivery", pa.string()),
-    pa.field("price",         pa.string()),
-    pa.field("flash_sale",    pa.string()),
-    pa.field("rating",        pa.int32()),
-    pa.field("comment",       pa.string()),
-    pa.field("reviewer_name", pa.string()),
-    pa.field("review_time",   pa.timestamp("ms")),
+    pa.field("platform", pa.string()), pa.field("brand", pa.string()),
+    pa.field("item_id", pa.int64()), pa.field("product_name", pa.string()),
+    pa.field("skin_type", pa.string()), pa.field("total_like", pa.int32()),
+    pa.field("formula", pa.string()), pa.field("time_delivery", pa.string()),
+    pa.field("price", pa.string()), pa.field("flash_sale", pa.string()),
+    pa.field("rating", pa.int32()), pa.field("comment", pa.string()),
+    pa.field("reviewer_name", pa.string()), pa.field("review_time", pa.timestamp("ms")),
 ])
 
-
-# ── S3 helpers ────────────────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _s3_client():
     import boto3
     from botocore.config import Config
-    return boto3.client(
-        "s3",
-        endpoint_url=S3_ENDPOINT_URL or None,
-        aws_access_key_id=AWS_ACCESS_KEY,
-        aws_secret_access_key=AWS_SECRET_KEY,
-        region_name=AWS_REGION,
-        config=Config(signature_version="s3v4"),
-    )
+    return boto3.client("s3", endpoint_url=S3_ENDPOINT_URL or None, aws_access_key_id=AWS_ACCESS_KEY, aws_secret_access_key=AWS_SECRET_KEY, region_name=AWS_REGION, config=Config(signature_version="s3v4"))
 
-
-def _checkpoint_exists(item_id: str) -> bool:
-    if not (S3_BUCKET and AWS_ACCESS_KEY):
-        return False
+def _checkpoint_exists(item_id):
+    if not (S3_BUCKET and AWS_ACCESS_KEY): return False
     try:
-        resp = _s3_client().head_object(
-            Bucket=S3_BUCKET, Key=f"checkpoints/shopee/{item_id}.done"
-        )
-        age_h = (datetime.now(timezone.utc) - resp["LastModified"]).total_seconds() / 3600
-        return age_h < 23
-    except Exception:
-        return False
+        resp = _s3_client().head_object(Bucket=S3_BUCKET, Key=f"checkpoints/shopee/{item_id}.done")
+        return (datetime.now(timezone.utc) - resp["LastModified"]).total_seconds() / 3600 < 23
+    except: return False
 
+def _write_checkpoint(item_id):
+    if not (S3_BUCKET and AWS_ACCESS_KEY): return
+    try: _s3_client().put_object(Bucket=S3_BUCKET, Key=f"checkpoints/shopee/{item_id}.done", Body=b"done")
+    except Exception as e: logger.warning(f"Checkpoint failed: {e}")
 
-def _write_checkpoint(item_id: str) -> None:
-    if not (S3_BUCKET and AWS_ACCESS_KEY):
-        return
+def _upload_to_s3(path):
+    if not (S3_BUCKET and AWS_ACCESS_KEY): return
     try:
-        _s3_client().put_object(
-            Bucket=S3_BUCKET, Key=f"checkpoints/shopee/{item_id}.done", Body=b"done"
-        )
-    except Exception as exc:
-        logger.warning(f"[Shopee] Checkpoint write failed: {exc}")
+        key = f"raw/shopee/{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}/{path.name}"
+        _s3_client().upload_file(str(path), S3_BUCKET, key)
+    except Exception as e: logger.warning(f"Upload failed: {e}")
 
+# ── Login Logic ──────────────────────────────────────────────────────────────
 
-def _upload_to_s3(local_path: Path) -> None:
-    if not (S3_BUCKET and AWS_ACCESS_KEY):
-        return
+def get_session_cookies():
+    """Tries to get a valid session. Returns cookie string."""
+    if SHOPEE_COOKIE:
+        logger.info("Using provided SHOPEE_COOKIE from secrets.")
+        return SHOPEE_COOKIE
+
+    if not SHOPEE_USER or not SHOPEE_PASS:
+        logger.warning("No cookies or credentials found. Running unauthenticated (high risk of block).")
+        return ""
+
+    logger.info(f"Attempting Selenium login for user: {SHOPEE_USER}")
+    options = uc.ChromeOptions()
+    if IS_CI:
+        options.add_argument("--headless=new")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+
+    driver = uc.Chrome(options=options)
     try:
-        run_ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        key    = f"raw/shopee/{run_ts}/{local_path.name}"
-        _s3_client().upload_file(str(local_path), S3_BUCKET, key)
-        logger.info(f"[Shopee] Uploaded → s3://{S3_BUCKET}/{key}")
-    except Exception as exc:
-        logger.warning(f"[Shopee] S3 upload failed (continuing): {exc}")
+        driver.get("https://shopee.vn/buyer/login")
+        time.sleep(3)
+        
+        # Fill credentials
+        driver.find_element(By.NAME, "loginKey").send_keys(SHOPEE_USER)
+        driver.find_element(By.NAME, "password").send_keys(SHOPEE_PASS)
+        driver.find_element(By.XPATH, "//button[contains(text(), 'Đăng nhập') or contains(text(), 'Log In')]").click()
+        
+        # Wait for login success (redirect to home or profile)
+        time.sleep(10) 
+        
+        # Capture cookies
+        cookies = driver.get_cookies()
+        cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+        logger.success("Login successful, cookies captured.")
+        return cookie_str
+    except Exception as e:
+        logger.error(f"Login failed: {e}")
+        return ""
+    finally:
+        driver.quit()
 
-
-# ── HTTP session with anti-ban headers ────────────────────────────────────────
-
-def _make_session() -> requests.Session:
-    session = requests.Session()
-    proxies = {}
-    if PROXY_HOST and PROXY_PORT:
-        proxy_url = f"http://{PROXY_HOST}:{PROXY_PORT}"
-        if PROXY_USER and PROXY_PASS:
-            proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
-        proxies = {"http": proxy_url, "https": proxy_url}
-        logger.info(f"[Shopee] Using proxy: {PROXY_HOST}:{PROXY_PORT}")
-
-    session.proxies.update(proxies)
-    session.headers.update({
-        "User-Agent":      random.choice(USER_AGENTS),
-        "Accept":          "application/json",
-        "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8",
-        "Referer":         "https://shopee.vn/",
-        "x-api-source":    "pc",
-        "x-csrftoken":     "dummy",         # not validated on GET endpoints
-    })
-    return session
-
-
-# ── Shopee API calls (no login required) ──────────────────────────────────────
-
-def _api_search_products(session: requests.Session, brand: str, limit: int = 20) -> list[dict]:
-    """
-    Search Shopee using the HTML search page and parse __NEXT_DATA__ JSON.
-    No cookies or auth required.
-
-    Shopee embeds all search results as JSON in a <script id="__NEXT_DATA__"> tag.
-    This avoids the 403 on the API endpoint which requires session cookies.
-    """
-    url    = "https://shopee.vn/search"
-    params = {"keyword": f"{brand} skincare"}
-
-    try:
-        resp = session.get(url, params=params, timeout=20)
-        resp.raise_for_status()
-        html = resp.text
-
-        # Extract __NEXT_DATA__ JSON block
-        match = re.search(
-            r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
-            html, re.DOTALL
-        )
-        if not match:
-            # Fallback: find any JSON blob containing itemid+shopid pairs
-            ids = re.findall(r'"itemid":(\d+)', html)
-            sids = re.findall(r'"shopid":(\d+)', html)
-            names = re.findall(r'"name":"([^"]{5,80})"', html)
-            products = []
-            for i, (iid, sid) in enumerate(zip(ids[:limit], sids[:limit])):
-                products.append({
-                    "item_id":      iid,
-                    "shop_id":      sid,
-                    "product_name": names[i] if i < len(names) else f"Shopee Product {iid}",
-                    "brand":        brand,
-                })
-            logger.info(f"[Shopee] {brand}: found {len(products)} products (fallback regex)")
-            return products
-
-        next_data = json.loads(match.group(1))
-
-        # Navigate the __NEXT_DATA__ tree: props.pageProps.initialState.shopee.listingData.items
-        # or props.pageProps.data.sections[0].data.item
-        items = []
-        try:
-            items = (
-                next_data["props"]["pageProps"]["initialState"]["shopee"]["listingData"]["items"]
-            )
-        except (KeyError, TypeError):
-            pass
-
-        if not items:
-            # Try alternate path
-            raw = json.dumps(next_data)
-            ids   = re.findall(r'"itemid":(\d+)', raw)
-            sids  = re.findall(r'"shopid":(\d+)', raw)
-            names = re.findall(r'"name":"([^"]{5,80})"', raw)
-            for i, (iid, sid) in enumerate(zip(ids[:limit], sids[:limit])):
-                items.append({"item_basic": {
-                    "itemid": int(iid),
-                    "shopid": int(sid),
-                    "name":   names[i] if i < len(names) else f"Shopee Product {iid}",
-                }})
-
-        products = []
-        for item in items[:limit]:
-            info    = item.get("item_basic") or item
-            item_id = str(info.get("itemid") or info.get("item_id") or "")
-            shop_id = str(info.get("shopid") or info.get("shop_id") or "")
-            name    = info.get("name", f"Shopee Product {item_id}")
-            if item_id and shop_id:
-                products.append({
-                    "item_id":      item_id,
-                    "shop_id":      shop_id,
-                    "product_name": name,
-                    "brand":        brand,
-                })
-
-        logger.info(f"[Shopee] {brand}: found {len(products)} products")
-        return products
-
-    except Exception as exc:
-        logger.warning(f"[Shopee API] Search failed for '{brand}': {exc}")
-        return []
-
-
-def _api_get_reviews(
-    session: requests.Session,
-    item_id: str,
-    shop_id: str,
-    limit: int = 50,
-) -> list[dict]:
-    """
-    Fetch reviews via Shopee's ratings API.
-    No login required — returns up to `limit` reviews.
-
-    API: GET https://shopee.vn/api/v2/item/get_ratings
-    """
-    url    = "https://shopee.vn/api/v2/item/get_ratings"
-    params = {
-        "filter":   0,      # 0 = all ratings
-        "flag":     1,
-        "itemid":   item_id,
-        "limit":    limit,
-        "offset":   0,
-        "shopid":   shop_id,
-        "type":     0,
-    }
-    try:
-        resp = session.get(url, params=params, timeout=15)
-        resp.raise_for_status()
-        data    = resp.json()
-        ratings = (
-            data.get("data", {}).get("ratings")
-            or data.get("ratings")
-            or []
-        )
-        return ratings
-    except Exception as exc:
-        logger.warning(f"[Shopee API] Reviews failed for item {item_id}: {exc}")
-        return []
-
-
-# ── Main scraper class ────────────────────────────────────────────────────────
+# ── Scraper ──────────────────────────────────────────────────────────────────
 
 class ShopeeScraper:
-    """
-    API-first Shopee scraper. No browser, no login.
-    Uses Shopee's internal JSON APIs directly via requests.
-    Selenium only used as fallback if API returns 0 results.
-    """
-
     def __init__(self):
         self.output_dir = Path("data/raw/shopee")
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.session    = _make_session()
+        self.cookie = get_session_cookies()
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": random.choice(USER_AGENTS),
+            "Cookie": self.cookie,
+            "Referer": "https://shopee.vn/",
+            "x-api-source": "pc"
+        })
 
-    def _jitter(self):
-        time.sleep(random.uniform(*BETWEEN_PRODUCTS_S))
+    def search_products(self, brand):
+        url = "https://shopee.vn/api/v4/search/search_items"
+        params = {"keyword": f"{brand} skincare", "limit": 20, "by": "relevancy", "order": "desc", "page_type": "search", "scenario": "PAGE_GLOBAL_SEARCH", "version": 2}
+        try:
+            # First try direct API
+            resp = self.session.get(url, params=params, timeout=15)
+            if resp.status_code == 403:
+                # Try HTML fallback if API is blocked
+                logger.info(f"API 403 for {brand}, trying HTML fallback...")
+                resp = self.session.get("https://shopee.vn/search", params={"keyword": f"{brand} skincare"}, timeout=15)
+                ids = re.findall(r'"itemid":(\d+)', resp.text)
+                sids = re.findall(r'"shopid":(\d+)', resp.text)
+                return [{"item_id": i, "shop_id": s, "product_name": f"{brand} Product {i}"} for i, s in zip(ids, sids)]
+            
+            data = resp.json()
+            items = data.get("data", {}).get("items", []) or data.get("items", [])
+            return [{"item_id": str(i.get("item_basic", i).get("itemid")), "shop_id": str(i.get("item_basic", i).get("shopid")), "product_name": i.get("item_basic", i).get("name")} for i in items]
+        except Exception as e:
+            logger.error(f"Search failed: {e}")
+            return []
 
-    def scrape_all(self) -> int:
-        """Main entry: discover products via API, fetch reviews via API."""
+    def get_reviews(self, item_id, shop_id):
+        url = "https://shopee.vn/api/v2/item/get_ratings"
+        params = {"itemid": item_id, "shopid": shop_id, "limit": 50, "offset": 0, "filter": 0, "type": 0}
+        try:
+            resp = self.session.get(url, params=params, timeout=15)
+            return resp.json().get("data", {}).get("ratings", [])
+        except: return []
+
+    def run(self):
         total = 0
-
         for brand in TARGET_BRANDS:
-            logger.info(f"[Shopee] Brand: {brand}")
-
-            # Layer 3 — timing jitter between brands
-            time.sleep(random.uniform(2.0, 4.5))
-
-            products = _api_search_products(
-                self.session, brand, limit=PRODUCTS_PER_BRAND
-            )
-
+            logger.info(f"Processing Brand: {brand}")
+            products = self.search_products(brand)
             for p in products[:PRODUCTS_PER_BRAND]:
-                item_id = p["item_id"]
-                shop_id = p["shop_id"]
-
-                # S3 checkpoint — skip if scraped today
-                if _checkpoint_exists(item_id):
-                    logger.info(f"[Shopee] Skip (scraped today): {p['product_name'][:40]}")
-                    continue
-
-                deadline = time.time() + PRODUCT_TIMEOUT_S
-                ratings  = _api_get_reviews(
-                    self.session, item_id, shop_id, limit=MAX_REVIEWS_PER_PRODUCT
-                )
-
-                if time.time() > deadline:
-                    logger.warning(f"[Shopee] Timeout for {p['product_name'][:40]}")
-                    continue
-
+                if _checkpoint_exists(p['item_id']): continue
+                
+                ratings = self.get_reviews(p['item_id'], p['shop_id'])
                 reviews = []
-                for r in ratings[:MAX_REVIEWS_PER_PRODUCT]:
-                    comment = (r.get("comment") or "").strip()
-                    if not comment:
-                        continue
-
-                    # review_time: Shopee returns Unix timestamp in seconds
-                    ts_raw = r.get("ctime") or r.get("mtime") or 0
-                    try:
-                        review_time = datetime.utcfromtimestamp(int(ts_raw))
-                    except Exception:
-                        review_time = datetime.utcnow()
-
+                for r in ratings:
+                    if not r.get("comment"): continue
                     reviews.append({
-                        "platform":      "shopee",
-                        "brand":         brand,
-                        "item_id":       int(item_id),
-                        "product_name":  p["product_name"],
-                        "skin_type":     "",
-                        "total_like":    int(r.get("liked_count") or 0),
-                        "formula":       "",
-                        "time_delivery": "",
-                        "price":         "",
-                        "flash_sale":    "No",
-                        "rating":        int(r.get("rating_star") or r.get("rating") or 0),
-                        "comment":       comment,
-                        "reviewer_name": r.get("author_username") or r.get("username") or "anonymous",
-                        "review_time":   review_time,
+                        "platform": "shopee", "brand": brand, "item_id": int(p['item_id']),
+                        "product_name": p['product_name'], "skin_type": "", "total_like": r.get("liked_count", 0),
+                        "formula": "", "time_delivery": "", "price": "", "flash_sale": "No",
+                        "rating": r.get("rating_star", 0), "comment": r.get("comment"),
+                        "reviewer_name": r.get("author_username", "anon"),
+                        "review_time": datetime.utcfromtimestamp(r.get("ctime", time.time()))
                     })
-
+                
                 if reviews:
-                    ts       = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-                    out_path = self.output_dir / f"shopee_{item_id}_{ts}.parquet"
-                    table    = pa.Table.from_pylist(reviews, schema=SHOPEE_SCHEMA)
-                    pq.write_table(table, out_path, compression="snappy")
-                    logger.info(f"[Shopee] {len(reviews)} reviews → {out_path.name}")
-                    _upload_to_s3(out_path)
-                    _write_checkpoint(item_id)
+                    out = self.output_dir / f"shopee_{p['item_id']}.parquet"
+                    pq.write_table(pa.Table.from_pylist(reviews, schema=SHOPEE_SCHEMA), out)
+                    _upload_to_s3(out)
+                    _write_checkpoint(p['item_id'])
                     total += len(reviews)
-
-                self._jitter()
-
-        return total
-
+            time.sleep(random.uniform(2, 5))
+        logger.success(f"Shopee Done: {total} reviews")
 
 if __name__ == "__main__":
-    logger.add(lambda msg: print(msg, end=""), level="INFO", colorize=False)
-    logger.info("[Shopee] API-first scraper — no login required")
-    scraper = ShopeeScraper()
-    total   = scraper.scrape_all()
-    logger.success(f"[Shopee] Done. Total reviews: {total}")
+    ShopeeScraper().run()

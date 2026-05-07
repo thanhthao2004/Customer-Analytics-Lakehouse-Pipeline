@@ -86,12 +86,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Chrome (stable)
+        run: |
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
+            | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] \
+            http://dl.google.com/linux/chrome/deb/ stable main" \
+            | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update -q
+          sudo apt-get install -y google-chrome-stable
+          google-chrome --version
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      - name: Install scraping deps (API-only — no Chrome needed)
+      - name: Install scraping deps (with Selenium for Login)
         run: |
           python -m pip install --upgrade pip
           pip install \
@@ -99,13 +110,18 @@ jobs:
             pyarrow==15.0.0 \
             boto3==1.34.0 \
             botocore==1.34.0 \
-            loguru==0.7.2
+            loguru==0.7.2 \
+            undetected-chromedriver==3.5.5 \
+            selenium==4.18.1
 
       - name: Run Shopee scraper
         id: scrape
         env:
           CI: "true"
           PLATFORM: "shopee"
+          SHOPEE_USER:           ${{ secrets.SHOPEE_USER }}
+          SHOPEE_PASS:           ${{ secrets.SHOPEE_PASS }}
+          SHOPEE_COOKIE:         ${{ secrets.SHOPEE_COOKIE }}
           AWS_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           S3_BUCKET:             ${{ secrets.S3_BUCKET }}
@@ -114,7 +130,7 @@ jobs:
           PROXY_HOST:            ${{ secrets.PROXY_HOST }}
           PROXY_PORT:            ${{ secrets.PROXY_PORT }}
           PROXY_USER:            ${{ secrets.PROXY_USER }}
-          PROXY_PASS:            ${{ secrets.PROXwwY_PASS }}
+          PROXY_PASS:            ${{ secrets.PROXY_PASS }}
         run: |
           python src/ingestion/scrapers/shopee_scraper.py
           # Count output rows
@@ -150,12 +166,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Chrome (stable)
+        run: |
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
+            | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] \
+            http://dl.google.com/linux/chrome/deb/ stable main" \
+            | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update -q
+          sudo apt-get install -y google-chrome-stable
+          google-chrome --version
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      - name: Install scraping deps (API-only — no Chrome needed)
+      - name: Install scraping deps (with Selenium for Login)
         run: |
           python -m pip install --upgrade pip
           pip install \
@@ -163,13 +190,18 @@ jobs:
             pyarrow==15.0.0 \
             boto3==1.34.0 \
             botocore==1.34.0 \
-            loguru==0.7.2
+            loguru==0.7.2 \
+            undetected-chromedriver==3.5.5 \
+            selenium==4.18.1
 
       - name: Run Lazada scraper
         id: scrape
         env:
           CI: "true"
           PLATFORM: "lazada"
+          LAZADA_USER:           ${{ secrets.LAZADA_USER }}
+          LAZADA_PASS:           ${{ secrets.LAZADA_PASS }}
+          LAZADA_COOKIE:         ${{ secrets.LAZADA_COOKIE }}
           AWS_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           S3_BUCKET:             ${{ secrets.S3_BUCKET }}
