@@ -307,4 +307,68 @@ def _dedup_against_existing(df: DataFrame, spark: SparkSession) -> DataFrame:
             )
             .drop("_review_key")
         )
-      
+        new_count = deduped.count()
+        logger.info(f"Dedup: {df.count()} incoming → {new_count} new rows to insert")
+        return deduped
+    except Exception as exc:
+        logger.warning(f"Dedup failed (inserting all rows): {exc}")
+        return df
+
+
+def load_to_postgres(df: DataFrame, spark: SparkSession | None = None) -> None:
+    logger.info(f"JDBC load → {POSTGRES_HOST}/{POSTGRES_DB} :: staging.reviews (mode={JDBC_WRITE_MODE})")
+
+    # In incremental mode, anti-join against existing rows before insert
+    if SPARK_MODE == "incremental" and spark is not None:
+        df = _dedup_against_existing(df, spark)
+
+    if df.count() == 0:
+        logger.info("No new rows to insert — staging.reviews already up to date.")
+        return
+
+    (
+        df.write.format("jdbc")
+        .option("url", JDBC_URL)
+        .option("dbtable", "staging.reviews")
+        .option("user", POSTGRES_USER)
+        .option("password", POSTGRES_PASS)
+        .option("driver", JDBC_DRIVER)
+        .option("batchsize", 1000)
+        .mode(JDBC_WRITE_MODE)
+        .save()
+    )
+    logger.success("PostgreSQL load complete.")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def run_pipeline():
+    logger.add(sys.stdout, level="INFO", colorize=False)
+    logger.info("=" * 60)
+    logger.info("Customer Analytics Spark Pipeline — Cloud S3 Mode")
+    logger.info(f"  Mode     : {SPARK_MODE}")
+    logger.info(f"  Bucket   : {S3_BUCKET}")
+    logger.info(f"  Endpoint : {S3_ENDPOINT or 'AWS default'}")
+    logger.info(f"  Postgres : {POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}")
+    logger.info(f"  Today UTC: {TODAY_UTC}")
+    logger.info("=" * 60)
+
+    spark = create_spark_session()
+    spark.sparkContext.setLogLevel("WARN")
+
+    raw_df       = read_raw(spark)
+    cleaned_df   = clean_and_enrich(raw_df)
+    validated_df = check_data_quality(cleaned_df)
+    logger.info(f"Clean rows after QC: {validated_df.count()}")
+
+    labeled_df = label_sentiment_with_gemini(validated_df)
+    write_processed(labeled_df)
+    load_to_postgres(labeled_df, spark)  # pass spark for incremental dedup
+
+    spark.stop()
+    logger.success("Pipeline complete ✓")
+
+
+if __name__ == "__main__":
+    run_pipeline()
