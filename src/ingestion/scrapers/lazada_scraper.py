@@ -1,364 +1,382 @@
 """
-Lazada VN review scraper.
-Uses Selenium (undetected_chromedriver) to bypass captchas/Datadome.
+Lazada VN Review Scraper — API-first, no login required.
 
-Target: Skincare products on Lazada VN (Health & Beauty > Skincare)
-URL pattern: lazada.vn/products/-i{item_id}.html
+Strategy:
+  1. Product discovery: Lazada search API (JSON, no browser needed)
+  2. Review fetching:   Lazada review API (JSON, no login needed)
 
-Cloud/GHA mode:
-  Set CI=true to enable headless mode + GHA Chrome flags.
-  Set PROXY_HOST/PROXY_PORT/PROXY_USER/PROXY_PASS for residential proxy.
+Lazada APIs used:
+  Search:  GET https://www.lazada.vn/catalog/?q=...&ajax=true
+  Reviews: GET https://my.lazada.vn/pdp/review/getReviewList?itemId=...&pageSize=50&pageNo=1
+
+Anti-ban:
+  - User-agent rotation
+  - Request timing jitter
+  - Residential proxy support (PROXY_* env vars)
+
+GHA: CI=true → fully headless (API, no Chrome needed)
+Credentials: NOT required. Lazada review API is public.
 """
 
 import os
-import time
-import random
-import ssl
 import re
+import ssl
+import json
+import random
+import time
+import urllib.parse
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
-# On macOS (local dev) bypass SSL verification for uc driver downloads.
-if ssl.OPENSSL_VERSION.startswith("OpenSSL") and os.name == "posix" and not os.environ.get("CI"):
-    ssl._create_default_https_context = ssl._create_unverified_context
+import requests
+import pyarrow as pa
+import pyarrow.parquet as pq
+from loguru import logger
 
-# ── Cloud / GHA detection ─────────────────────────────────────────────────────
+# ── GHA / Cloud detection ──────────────────────────────────────────────────────
 IS_CI = os.environ.get("CI", "").lower() in ("true", "1", "yes")
 
-# ── Proxy config ─────────────────────────────────────────────────────────────
+if not IS_CI and ssl.OPENSSL_VERSION.startswith("OpenSSL") and os.name == "posix":
+    ssl._create_default_https_context = ssl._create_unverified_context
+
+# ── Proxy ──────────────────────────────────────────────────────────────────────
 PROXY_HOST = os.environ.get("PROXY_HOST", "")
 PROXY_PORT = os.environ.get("PROXY_PORT", "")
 PROXY_USER = os.environ.get("PROXY_USER", "")
 PROXY_PASS = os.environ.get("PROXY_PASS", "")
 
-# ── S3 / R2 upload config ─────────────────────────────────────────────────────
+# ── S3 / R2 ────────────────────────────────────────────────────────────────────
 S3_BUCKET       = os.environ.get("S3_BUCKET", "")
 S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL", "")
 AWS_ACCESS_KEY  = os.environ.get("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_KEY  = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
 AWS_REGION      = os.environ.get("AWS_REGION", "auto")
 
-import pyarrow as pa
-import pyarrow.parquet as pq
-import undetected_chromedriver as uc
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from loguru import logger
+# ── Crawl targets ──────────────────────────────────────────────────────────────
+TARGET_BRANDS = [
+    "CeraVe", "La Roche-Posay", "Innisfree", "The Ordinary",
+    "Bioderma", "Hada Labo", "Klairs", "Anessa", "Senka", "Neutrogena",
+]
+PRODUCTS_PER_BRAND      = 10
+MAX_REVIEWS_PER_PRODUCT = 50
+PRODUCT_TIMEOUT_S       = 45
+BETWEEN_PRODUCTS_S      = (1.5, 3.0)
 
-from config import settings
-
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
 
 LAZADA_SCHEMA = pa.schema([
-    pa.field("platform", pa.string()),
-    pa.field("item_id", pa.string()),
-    pa.field("product_name", pa.string()),
-    pa.field("rating", pa.int32()),
-    pa.field("comment", pa.string()),
-    pa.field("reviewer_name", pa.string()),
-    pa.field("helpful_count", pa.int32()),
-    pa.field("review_time", pa.timestamp("ms")),
+    pa.field("platform",             pa.string()),
+    pa.field("item_id",              pa.string()),
+    pa.field("product_name",         pa.string()),
+    pa.field("rating",               pa.int32()),
+    pa.field("comment",              pa.string()),
+    pa.field("reviewer_name",        pa.string()),
+    pa.field("helpful_count",        pa.int32()),
+    pa.field("review_time",          pa.timestamp("ms")),
     pa.field("is_verified_purchase", pa.bool_()),
-    pa.field("scraped_at", pa.timestamp("ms")),
+    pa.field("scraped_at",           pa.timestamp("ms")),
 ])
 
 
-class LazadaScraper:
-    """Scrapes skincare product reviews from Lazada VN via Selenium."""
+# ── S3 helpers ────────────────────────────────────────────────────────────────
 
-    def __init__(self, output_dir: str | None = None):
-        self.output_dir = Path(output_dir or settings.RAW_DATA_DIR) / "lazada"
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.driver = None
+def _s3_client():
+    import boto3
+    from botocore.config import Config
+    return boto3.client(
+        "s3",
+        endpoint_url=S3_ENDPOINT_URL or None,
+        aws_access_key_id=AWS_ACCESS_KEY,
+        aws_secret_access_key=AWS_SECRET_KEY,
+        region_name=AWS_REGION,
+        config=Config(signature_version="s3v4"),
+    )
 
-    def init_driver(self):
-        options = uc.ChromeOptions()
 
-        # ── GHA headless flags ───────────────────────────────────────────────────
-        if IS_CI:
-            options.add_argument("--headless=new")
-            options.add_argument("--no-sandbox")
-            options.add_argument("--disable-dev-shm-usage")
-            options.add_argument("--disable-gpu")
-            options.add_argument("--window-size=1280,1024")
-            options.add_argument("--disable-extensions")
-            options.add_argument("--disable-setuid-sandbox")
-        else:
-            options.add_argument("--disable-gpu")
-            options.add_argument("--window-size=1280,1024")
-            options.add_argument("--no-sandbox")
-            options.add_argument("--disable-dev-shm-usage")
+def _checkpoint_exists(item_id: str) -> bool:
+    if not (S3_BUCKET and AWS_ACCESS_KEY):
+        return False
+    try:
+        resp = _s3_client().head_object(
+            Bucket=S3_BUCKET, Key=f"checkpoints/lazada/{item_id}.done"
+        )
+        age_h = (datetime.now(timezone.utc) - resp["LastModified"]).total_seconds() / 3600
+        return age_h < 23
+    except Exception:
+        return False
 
-        # ── Proxy injection ───────────────────────────────────────────────────
-        if PROXY_HOST and PROXY_PORT:
-            options.add_argument(f"--proxy-server=http://{PROXY_HOST}:{PROXY_PORT}")
-            logger.info(f"[Lazada] Using proxy: {PROXY_HOST}:{PROXY_PORT}")
 
-        # version_main=None → auto-detect installed Chrome version on GHA runner
-        chrome_version = None if IS_CI else 146
-        self.driver = uc.Chrome(options=options, version_main=chrome_version)
+def _write_checkpoint(item_id: str) -> None:
+    if not (S3_BUCKET and AWS_ACCESS_KEY):
+        return
+    try:
+        _s3_client().put_object(
+            Bucket=S3_BUCKET, Key=f"checkpoints/lazada/{item_id}.done", Body=b"done"
+        )
+    except Exception as exc:
+        logger.warning(f"[Lazada] Checkpoint write failed: {exc}")
 
-        # CDP proxy auth (authenticated proxies)
-        if IS_CI and PROXY_HOST and PROXY_USER and PROXY_PASS:
-            self.driver.execute_cdp_cmd("Network.enable", {})
-            self.driver.execute_cdp_cmd(
-                "Network.setExtraHTTPHeaders",
-                {"headers": {
-                    "Proxy-Authorization": __import__('base64').b64encode(
-                        f"{PROXY_USER}:{PROXY_PASS}".encode()
-                    ).decode()
-                }}
-            )
 
-    def force_close_modals(self):
-        """Use Javascript to forcefully destroy Lazada's blocking popups & overlays."""
-        try:
-            self.driver.execute_script("""
-                document.querySelectorAll('.lazada-popup, .lzd-modal, .lzd-site-nav-menu-modal').forEach(e => e.remove());
-                let closeBtns = document.querySelectorAll('div[data-spm="close"], div[data-spm="btn-close"]');
-                closeBtns.forEach(btn => btn.click());
-            """)
-        except Exception:
-            pass
+def _upload_to_s3(local_path: Path) -> None:
+    if not (S3_BUCKET and AWS_ACCESS_KEY):
+        return
+    try:
+        run_ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        key    = f"raw/lazada/{run_ts}/{local_path.name}"
+        _s3_client().upload_file(str(local_path), S3_BUCKET, key)
+        logger.info(f"[Lazada] Uploaded → s3://{S3_BUCKET}/{key}")
+    except Exception as exc:
+        logger.warning(f"[Lazada] S3 upload failed (continuing): {exc}")
 
-    def parse_brands_from_category(self) -> list[str]:
-        cat_file = Path("data/html-scripts/category.txt")
-        if not cat_file.exists():
-            return ["CeraVe", "La Roche-Posay", "Innisfree", "The Ordinary", "Bioderma", "Hada Labo"]
-        
-        lines = cat_file.read_text(encoding="utf-8").strip().split('\n')
-        # Lazada line says "Same brands", so extract from the Shopee line
-        for line in lines:
-            if line.startswith("Shopee"):
-                brands_str = line.split("\t")[-1]
-                return [b.strip() for b in brands_str.split(",")]
-        return ["CeraVe"]
 
-    def discover_products(self, target_count=100) -> list[dict]:
-        """Dynamically search and identify products for target brands."""
-        if not self.driver:
-            self.init_driver()
+# ── HTTP session ──────────────────────────────────────────────────────────────
 
-        brands = self.parse_brands_from_category()
+def _make_session() -> requests.Session:
+    session = requests.Session()
+    proxies = {}
+    if PROXY_HOST and PROXY_PORT:
+        proxy_url = f"http://{PROXY_HOST}:{PROXY_PORT}"
+        if PROXY_USER and PROXY_PASS:
+            proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
+        proxies = {"http": proxy_url, "https": proxy_url}
+        logger.info(f"[Lazada] Using proxy: {PROXY_HOST}:{PROXY_PORT}")
+
+    session.proxies.update(proxies)
+    session.headers.update({
+        "User-Agent":      random.choice(USER_AGENTS),
+        "Accept":          "application/json, text/plain, */*",
+        "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8",
+        "Referer":         "https://www.lazada.vn/",
+    })
+    return session
+
+
+# ── Lazada API calls (no login required) ─────────────────────────────────────
+
+def _api_search_products(session: requests.Session, brand: str, limit: int = 20) -> list[dict]:
+    """
+    Search Lazada catalog via AJAX endpoint.
+    Returns list of {item_id, product_name, brand} dicts.
+
+    API: GET https://www.lazada.vn/catalog/?q={brand+skincare}&ajax=true
+    No authentication required.
+    """
+    url    = "https://www.lazada.vn/catalog/"
+    params = {
+        "q":    f"{brand} skincare",
+        "ajax": "true",
+        "page": 1,
+    }
+    try:
+        resp = session.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data  = resp.json()
+        mods  = data.get("mods", {})
+
+        # Lazada AJAX returns listItems under mods.listItems
+        items = (
+            mods.get("listItems", [])
+            or data.get("rgn", {}).get("modules", {}).get("item", {}).get("data", {}).get("rows", [])
+        )
+
         products = []
-        seen_ids = set()
-        products_per_brand = max(4, target_count // len(brands) + 1)
+        for item in items[:limit]:
+            item_id = str(
+                item.get("itemId")
+                or item.get("skuId")
+                or item.get("productId")
+                or ""
+            )
+            name = item.get("name") or item.get("productName") or f"Lazada Product {item_id}"
+            if item_id:
+                products.append({
+                    "item_id":      item_id,
+                    "product_name": name,
+                    "brand":        brand,
+                })
 
-        import urllib.parse
-        for brand in brands:
-            if len(products) >= target_count:
-                break
-                
-            logger.info(f"[Lazada] Discovering top products for: '{brand}'...")
-            url = f"https://www.lazada.vn/catalog/?q={urllib.parse.quote(brand + ' skincare')}"
-            
-            self.driver.get(url)
-            time.sleep(4)
-            
-            if "login" in self.driver.current_url.lower() or "verify" in self.driver.current_url.lower():
-                logger.warning("[Lazada] Login or verification required!")
-                logger.warning("[Lazada] Please solve the captcha or login manually in the open browser window.")
-                logger.warning("[Lazada] Pausing for 60 seconds...")
-                time.sleep(60)
-                self.driver.get(url)
-                time.sleep(4)
+        # Fallback: extract itemId from URL patterns in raw HTML/JSON text
+        if not products:
+            raw_text = resp.text
+            ids_found = re.findall(r'"itemId"\s*:\s*"?(\d+)"?', raw_text)
+            names_found = re.findall(r'"name"\s*:\s*"([^"]{5,80})"', raw_text)
+            for i, iid in enumerate(set(ids_found[:limit])):
+                products.append({
+                    "item_id":      iid,
+                    "product_name": names_found[i] if i < len(names_found) else f"Lazada Product {iid}",
+                    "brand":        brand,
+                })
 
-            self.force_close_modals()
-
-            # Scroll to load search results lazy items
-            for _ in range(4):
-                self.driver.execute_script("window.scrollBy(0, 1000);")
-                time.sleep(1)
-
-            try:
-                items = self.driver.find_elements(By.CSS_SELECTOR, "a[href*='-i']")
-                brand_count = 0
-                for item in items:
-                    href = item.get_attribute("href")
-                    if not href:
-                        continue
-                        
-                    match = re.search(r'-i(\d+)(?:-s\d+)?\.html', href)
-                    if match:
-                        item_id = match.group(1)
-                        if item_id in seen_ids:
-                            continue
-                            
-                        # Extract product name robustly
-                        slug_match = re.search(r'products/(.*?)-i\d+', href)
-                        if slug_match:
-                            product_name = urllib.parse.unquote(slug_match.group(1).replace('-', ' '))
-                        else:
-                            try:
-                                product_name = item.text.strip()
-                            except:
-                                product_name = f"Lazada Product {item_id}"
-                        
-                        if not product_name: 
-                            product_name = f"Lazada Product {item_id}"
-                            
-                        products.append({
-                            "item_id": item_id,
-                            "product_name": product_name
-                        })
-                        seen_ids.add(item_id)
-                        brand_count += 1
-                        
-                        if brand_count >= products_per_brand or len(products) >= target_count:
-                            break
-            except Exception as e:
-                logger.error(f"[Lazada] Error during product discovery for {brand}: {e}")
-
-        logger.info(f"[Lazada] Identified {len(products)} high-volume products across {len(brands)} brands.")
+        logger.info(f"[Lazada API] {brand}: found {len(products)} products")
         return products
 
-    def scrape_item(
-        self,
-        item_id: str,
-        product_name: str,
-        max_reviews: int = 50,
-    ) -> list[dict]:
-        """Scrape reviews for a single product."""
-        if not self.driver:
-            self.init_driver()
+    except Exception as exc:
+        logger.warning(f"[Lazada API] Search failed for '{brand}': {exc}")
+        return []
 
-        url = f"https://www.lazada.vn/products/-i{item_id}.html"
-        self.driver.get(url)
-        time.sleep(3)
 
-        self.force_close_modals()
+def _api_get_reviews(
+    session: requests.Session,
+    item_id: str,
+    page_size: int = 50,
+) -> list[dict]:
+    """
+    Fetch reviews via Lazada's public review API.
+    No login required.
 
-        # Scroll to reviews
-        for i in range(6):
-            self.driver.execute_script("window.scrollBy(0, 800);")
-            time.sleep(1)
-            self.force_close_modals()
+    API: GET https://my.lazada.vn/pdp/review/getReviewList
+         params: itemId, pageSize, pageNo, filter, sort
+    """
+    url    = "https://my.lazada.vn/pdp/review/getReviewList"
+    params = {
+        "itemId":   item_id,
+        "pageSize": page_size,
+        "pageNo":   1,
+        "filter":   0,
+        "sort":     0,
+    }
+    try:
+        resp = session.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
 
-        product_reviews = []
-        page_count = 0
+        # Navigate the response structure
+        reviews = (
+            data.get("model", {}).get("items")
+            or data.get("data", {}).get("reviews")
+            or data.get("reviews")
+            or []
+        )
+        return reviews
 
-        logger.info(f"[Lazada] Scraping item_id={item_id}, product='{product_name[:30]}...'")
+    except Exception as exc:
+        logger.warning(f"[Lazada API] Reviews failed for item {item_id}: {exc}")
+        return []
 
-        while len(product_reviews) < max_reviews:
-            try:
-                review_elements = WebDriverWait(self.driver, 5).until(
-                    EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".item._h213"))
-                )
-            except TimeoutException:
-                logger.debug(f"[Lazada] No reviews found for {product_name[:30]}...")
-                break
 
-            for el in review_elements:
-                try:
-                    stars = el.find_elements(By.CSS_SELECTOR, "img[src*='star-yellow']")
-                    rating = len(stars)
+# ── Main scraper class ────────────────────────────────────────────────────────
 
-                    comment_el = el.find_elements(By.CSS_SELECTOR, ".content")
-                    comment = comment_el[0].text.strip() if comment_el else ""
+class LazadaScraper:
+    """
+    API-first Lazada scraper. No browser, no login.
+    Uses Lazada's internal JSON APIs directly via requests.
+    """
 
-                    if comment:
-                         product_reviews.append({
-                            "platform": "lazada",
-                            "item_id": item_id,
-                            "product_name": product_name,
-                            "rating": rating,
-                            "comment": comment,
-                            "reviewer_name": "anonymous",
-                            "helpful_count": 0,
-                            "review_time": datetime.utcnow(),
-                            "is_verified_purchase": False,
-                            "scraped_at": datetime.utcnow()
-                        })
-                except Exception:
-                    pass
+    def __init__(self):
+        self.output_dir = Path("data/raw/lazada")
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.session    = _make_session()
 
-            try:
-                next_btn = self.driver.find_element(By.CSS_SELECTOR, "button.next-pagination-item.next")
-                if next_btn.get_attribute("disabled"):
-                    break
-                self.driver.execute_script("arguments[0].click();", next_btn)
-                time.sleep(3)
-                self.force_close_modals()
-                
-                page_count += 1
-                if page_count > (max_reviews // 5):
-                     break
-            except NoSuchElementException:
-                break
+    def _jitter(self):
+        time.sleep(random.uniform(*BETWEEN_PRODUCTS_S))
 
-        logger.info(f"[Lazada] Collected {len(product_reviews)} reviews for '{product_name[:30]}...'")
-        return product_reviews[:max_reviews]
+    def scrape_all(self) -> int:
+        total = 0
+        now   = datetime.utcnow()
 
-    def save_to_parquet(self, reviews: list[dict], filename: str | None = None) -> Path | None:
-        if not reviews:
-            logger.warning("No Lazada reviews to save.")
-            return None
+        for brand in TARGET_BRANDS:
+            logger.info(f"[Lazada] Brand: {brand}")
+            time.sleep(random.uniform(2.0, 4.5))  # jitter between brands
 
-        fname = filename or f"lazada_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.parquet"
-        out_path = self.output_dir / fname
-
-        table = pa.Table.from_pylist(reviews, schema=LAZADA_SCHEMA)
-        pq.write_table(table, out_path, compression="snappy")
-        logger.info(f"[Lazada] Saved {len(reviews)} reviews → {out_path}")
-
-        # ── Auto-upload to R2/S3 when running on GHA ──────────────────────────
-        if IS_CI and S3_BUCKET and AWS_ACCESS_KEY:
-            self._upload_to_s3(out_path)
-
-        return out_path
-
-    def _upload_to_s3(self, local_path: Path) -> None:
-        """Upload a local Parquet file to Cloudflare R2 or AWS S3."""
-        try:
-            import boto3
-            from botocore.config import Config
-
-            endpoint = S3_ENDPOINT_URL or None
-            s3 = boto3.client(
-                "s3",
-                endpoint_url=endpoint,
-                aws_access_key_id=AWS_ACCESS_KEY,
-                aws_secret_access_key=AWS_SECRET_KEY,
-                region_name=AWS_REGION,
-                config=Config(signature_version="s3v4"),
+            products = _api_search_products(
+                self.session, brand, limit=PRODUCTS_PER_BRAND
             )
-            run_ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            key    = f"raw/lazada/{run_ts}/{local_path.name}"
-            s3.upload_file(str(local_path), S3_BUCKET, key)
-            logger.info(f"[Lazada] Uploaded → s3://{S3_BUCKET}/{key}")
-        except Exception as exc:
-            logger.warning(f"[Lazada] S3 upload failed (continuing): {exc}")
 
-    def run(
-        self,
-        products: list[dict] | None = None,
-        max_reviews_per_product: int = 50,
-    ) -> Path | None:
-        """
-        Scrape dynamic top products using Selenium, save to Parquet.
-        """
-        if products is None:
-            # Parse configured target brands to fetch 100 total products
-            products = self.discover_products(target_count=100)
+            for p in products[:PRODUCTS_PER_BRAND]:
+                item_id = p["item_id"]
 
-        all_reviews = []
-        try:
-            for product in products:
-                reviews = self.scrape_item(
-                    item_id=product["item_id"],
-                    product_name=product["product_name"],
-                    max_reviews=max_reviews_per_product,
+                if _checkpoint_exists(item_id):
+                    logger.info(f"[Lazada] Skip (scraped today): {p['product_name'][:40]}")
+                    continue
+
+                deadline = time.time() + PRODUCT_TIMEOUT_S
+                raw_reviews = _api_get_reviews(
+                    self.session, item_id, page_size=MAX_REVIEWS_PER_PRODUCT
                 )
-                all_reviews.extend(reviews)
-        finally:
-            if self.driver:
-                self.driver.quit()
 
-        return self.save_to_parquet(all_reviews)
+                if time.time() > deadline:
+                    logger.warning(f"[Lazada] Timeout for {p['product_name'][:40]}")
+                    continue
+
+                reviews = []
+                for r in raw_reviews[:MAX_REVIEWS_PER_PRODUCT]:
+                    comment = (
+                        r.get("reviewContent")
+                        or r.get("comment")
+                        or r.get("body")
+                        or ""
+                    ).strip()
+                    if not comment:
+                        continue
+
+                    rating = int(
+                        r.get("rating")
+                        or r.get("score")
+                        or r.get("ratingScore")
+                        or 0
+                    )
+
+                    reviewer = (
+                        r.get("reviewer", {}).get("name")
+                        or r.get("buyerName")
+                        or r.get("nickname")
+                        or "anonymous"
+                    )
+
+                    helpful = int(r.get("likeCount") or r.get("helpfulCount") or 0)
+                    verified = bool(r.get("verifiedBuyer") or r.get("reviewSources") == "verified_buyer")
+
+                    # Parse review time
+                    ts_raw = (
+                        r.get("reviewTime")
+                        or r.get("createdAt")
+                        or r.get("publishTime")
+                        or ""
+                    )
+                    review_time = now
+                    if ts_raw:
+                        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+                            try:
+                                review_time = datetime.strptime(str(ts_raw)[:19], fmt[:len(str(ts_raw)[:19])])
+                                break
+                            except Exception:
+                                continue
+
+                    reviews.append({
+                        "platform":             "lazada",
+                        "item_id":              item_id,
+                        "product_name":         p["product_name"],
+                        "rating":               min(rating, 5),
+                        "comment":              comment,
+                        "reviewer_name":        reviewer,
+                        "helpful_count":        helpful,
+                        "review_time":          review_time,
+                        "is_verified_purchase": verified,
+                        "scraped_at":           now,
+                    })
+
+                if reviews:
+                    ts       = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                    out_path = self.output_dir / f"lazada_{item_id}_{ts}.parquet"
+                    table    = pa.Table.from_pylist(reviews, schema=LAZADA_SCHEMA)
+                    pq.write_table(table, out_path, compression="snappy")
+                    logger.info(f"[Lazada] {len(reviews)} reviews → {out_path.name}")
+                    _upload_to_s3(out_path)
+                    _write_checkpoint(item_id)
+                    total += len(reviews)
+
+                self._jitter()
+
+        return total
 
 
 if __name__ == "__main__":
+    logger.add(lambda msg: print(msg, end=""), level="INFO", colorize=False)
+    logger.info("[Lazada] API-first scraper — no login required")
     scraper = LazadaScraper()
-    output_path = scraper.run(max_reviews_per_product=50) # Reduced to 50 for Selenium
-    print(f"Done! Saved to: {output_path}")
+    total   = scraper.scrape_all()
+    logger.success(f"[Lazada] Done. Total reviews: {total}")

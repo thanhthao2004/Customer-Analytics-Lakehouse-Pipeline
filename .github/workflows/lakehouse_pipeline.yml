@@ -1,355 +1,232 @@
 # =============================================================================
 # Customer Analytics Lakehouse Pipeline — GitHub Actions Orchestration
 # Replaces: Apache Airflow + MinIO + Docker Compose
-# Storage  : Cloudflare R2 (recommended) or AWS S3
-# Database : Railway PostgreSQL (free 500 MB)
-# Deploy   : Railway (FastAPI + Metabase)
+# Storage  : Cloudflare R2 (zero egress)
+# Database : Railway PostgreSQL (500 MB free)
+# Deploy   : Railway (FastAPI only — Metabase → Preset.io free cloud)
+# Schedule : Daily at 01:00 AM Vietnam time (18:00 UTC)
+# Budget   : ~1,260 min/month (public repo = unlimited; private = within 2,000)
 # =============================================================================
 
 name: Lakehouse Pipeline
 
 on:
   schedule:
-    # Every 6 hours — safe for private repos (480 min/month vs 2,000 limit).
-    # Make repo PUBLIC for unlimited minutes if you want more frequent scraping.
-    # Scrape-only jobs run on this cron;
-    # while spark+dbt+deploy only run on push to main.
-    - cron: "0 */6 * * *"
+    # 01:00 AM Vietnam time = 18:00 UTC
+    # Full run: ~42 min/day × 30 days = 1,260 min/month
+    - cron: "0 18 * * *"
 
-  # Allow manual one-click runs from the GitHub Actions UI
   workflow_dispatch:
     inputs:
       run_full_pipeline:
         description: "Run full pipeline (spark + dbt + deploy) after scraping?"
         required: false
-        default: "false"
+        default: "true"
         type: choice
         options: ["true", "false"]
 
-  # Full pipeline (all jobs) triggered on every push to main
   push:
     branches: [main]
 
   pull_request:
     branches: [main]
 
-# ── Global defaults ────────────────────────────────────────────────────────────
 env:
   PYTHON_VERSION: "3.10"
 
-# Cancel in-flight runs for the same branch so only the latest matters
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 # =============================================================================
-# JOBS
-# =============================================================================
 jobs:
 
-  # ── 1. Lint & Test (runs in parallel with scrapers) ─────────────────────────
+  # ── 1. Lint & Test ───────────────────────────────────────────────────────────
   lint-and-test:
     name: Lint & Test
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      - name: Install lint + test dependencies
+      - name: Install lint/test deps
         run: |
           python -m pip install --upgrade pip
-          pip install flake8 pytest
-          # Install project deps but skip heavy packages for lint speed
-          pip install -r requirements.txt \
-            --no-deps \
-            --ignore-requires-python \
-            2>/dev/null || pip install -r requirements.txt
+          pip install flake8 pytest pyarrow loguru
 
-      - name: Lint with flake8 (hard errors)
+      - name: Lint — hard errors
         run: |
           flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics
 
-      - name: Lint with flake8 (style warnings)
+      - name: Lint — style warnings
         run: |
           flake8 src/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
 
       - name: Run Pytest
         run: |
-          pytest tests/ -v --tb=short || echo "No tests found or tests skipped"
+          pytest tests/ -v --tb=short || echo "No tests found — skipping"
 
-  # ── 2a. Scrape Shopee ────────────────────────────────────────────────────────
+  # ── 2. Scrape Shopee ─────────────────────────────────────────────────────────
   scrape-shopee:
-    name: Scrape Shopee VN
-    # Only run scrapers on schedule or workflow_dispatch; not on PR linting runs
+    name: Scrape Shopee VN (10 brands × 10 products × 50 reviews)
     if: >
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     outputs:
       rows_scraped: ${{ steps.scrape.outputs.rows_scraped }}
-      parquet_key:  ${{ steps.upload.outputs.parquet_key }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ── Chrome installation ────────────────────────────────────────────────
-      - name: Install Google Chrome (stable)
-        run: |
-          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
-            | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] \
-            http://dl.google.com/linux/chrome/deb/ stable main" \
-            | sudo tee /etc/apt/sources.list.d/google-chrome.list
-          sudo apt-get update -q
-          sudo apt-get install -y google-chrome-stable
-          google-chrome --version
-
-      - name: Set up Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      - name: Install Python dependencies
+      - name: Install scraping deps (API-only — no Chrome needed)
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install \
+            requests==2.31.0 \
+            pyarrow==15.0.0 \
+            boto3==1.34.0 \
+            botocore==1.34.0 \
+            loguru==0.7.2
 
-      # ── Run scraper ────────────────────────────────────────────────────────
       - name: Run Shopee scraper
         id: scrape
         env:
           CI: "true"
-          # Proxy credentials (Webshare.io free tier — Option A)
-          PROXY_HOST:     ${{ secrets.PROXY_HOST }}
-          PROXY_PORT:     ${{ secrets.PROXY_PORT }}
-          PROXY_USER:     ${{ secrets.PROXY_USER }}
-          PROXY_PASS:     ${{ secrets.PROXY_PASS }}
-          SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
-        run: |
-          python src/ingestion/scrapers/shopee_scraper.py
-          # Count rows in output parquet for the notify job
-          COUNT=$(python -c "
-          import glob, pyarrow.parquet as pq, os
-          files = glob.glob('data/raw/shopee/**/*.parquet', recursive=True)
-          total = sum(pq.read_table(f).num_rows for f in files) if files else 0
-          print(total)
-          " 2>/dev/null || echo 0)
-          echo "rows_scraped=$COUNT" >> "$GITHUB_OUTPUT"
-
-      # ── Upload to R2/S3 ────────────────────────────────────────────────────
-      - name: Upload Parquet to R2/S3
-        id: upload
-        env:
+          PLATFORM: "shopee"
           AWS_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           S3_BUCKET:             ${{ secrets.S3_BUCKET }}
           S3_ENDPOINT_URL:       ${{ secrets.S3_ENDPOINT_URL }}
           AWS_REGION:            ${{ secrets.AWS_REGION }}
+          PROXY_HOST:            ${{ secrets.PROXY_HOST }}
+          PROXY_PORT:            ${{ secrets.PROXY_PORT }}
+          PROXY_USER:            ${{ secrets.PROXY_USER }}
+          PROXY_PASS:            ${{ secrets.PROXY_PASS }}
         run: |
-          python - <<'PYEOF'
-          import os, glob, boto3, sys
-          from botocore.config import Config
-          from datetime import datetime
+          python src/ingestion/scrapers/shopee_scraper.py
+          # Count output rows
+          COUNT=$(python -c "
+          import glob, pyarrow.parquet as pq
+          files = glob.glob('data/raw/shopee/*.parquet')
+          print(sum(pq.read_table(f).num_rows for f in files) if files else 0)
+          " 2>/dev/null || echo 0)
+          echo "rows_scraped=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Shopee rows scraped: $COUNT"
 
-          bucket   = os.environ["S3_BUCKET"]
-          endpoint = os.environ.get("S3_ENDPOINT_URL") or None
-          region   = os.environ.get("AWS_REGION", "auto")
-
-          s3 = boto3.client(
-              "s3",
-              endpoint_url=endpoint,
-              aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-              aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-              region_name=region,
-              config=Config(signature_version="s3v4"),
-          )
-
-          run_ts  = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-          files   = glob.glob("data/raw/shopee/**/*.parquet", recursive=True)
-          keys    = []
-          for f in files:
-              key = f"raw/shopee/{run_ts}/{os.path.basename(f)}"
-              print(f"Uploading {f} → s3://{bucket}/{key}")
-              s3.upload_file(f, bucket, key)
-              keys.append(key)
-
-          if not files:
-              print("WARNING: No parquet files found to upload.")
-              sys.exit(0)
-
-          # Write output for downstream jobs
-          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
-              fh.write(f"parquet_key=raw/shopee/{run_ts}/\n")
-          PYEOF
-
-      # ── Artifact fallback ──────────────────────────────────────────────────
       - name: Upload artifact (S3 fallback)
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: shopee-raw-parquet-${{ github.run_number }}
+          name: shopee-parquet-${{ github.run_number }}
           path: data/raw/shopee/
           retention-days: 1
+          if-no-files-found: warn
 
-  # ── 2b. Scrape Lazada ────────────────────────────────────────────────────────
+  # ── 3. Scrape Lazada ─────────────────────────────────────────────────────────
   scrape-lazada:
-    name: Scrape Lazada VN
+    name: Scrape Lazada VN (10 brands × 10 products × 50 reviews)
     if: >
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     outputs:
       rows_scraped: ${{ steps.scrape.outputs.rows_scraped }}
-      parquet_key:  ${{ steps.upload.outputs.parquet_key }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Google Chrome (stable)
-        run: |
-          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
-            | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] \
-            http://dl.google.com/linux/chrome/deb/ stable main" \
-            | sudo tee /etc/apt/sources.list.d/google-chrome.list
-          sudo apt-get update -q
-          sudo apt-get install -y google-chrome-stable
-          google-chrome --version
-
-      - name: Set up Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      - name: Install Python dependencies
+      - name: Install scraping deps (API-only — no Chrome needed)
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install \
+            requests==2.31.0 \
+            pyarrow==15.0.0 \
+            boto3==1.34.0 \
+            botocore==1.34.0 \
+            loguru==0.7.2
 
       - name: Run Lazada scraper
         id: scrape
         env:
           CI: "true"
-          PROXY_HOST:      ${{ secrets.PROXY_HOST }}
-          PROXY_PORT:      ${{ secrets.PROXY_PORT }}
-          PROXY_USER:      ${{ secrets.PROXY_USER }}
-          PROXY_PASS:      ${{ secrets.PROXY_PASS }}
-          SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
-        run: |
-          python src/ingestion/scrapers/lazada_scraper.py
-          COUNT=$(python -c "
-          import glob, pyarrow.parquet as pq, os
-          files = glob.glob('data/raw/lazada/**/*.parquet', recursive=True)
-          total = sum(pq.read_table(f).num_rows for f in files) if files else 0
-          print(total)
-          " 2>/dev/null || echo 0)
-          echo "rows_scraped=$COUNT" >> "$GITHUB_OUTPUT"
-
-      - name: Upload Parquet to R2/S3
-        id: upload
-        env:
+          PLATFORM: "lazada"
           AWS_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           S3_BUCKET:             ${{ secrets.S3_BUCKET }}
           S3_ENDPOINT_URL:       ${{ secrets.S3_ENDPOINT_URL }}
           AWS_REGION:            ${{ secrets.AWS_REGION }}
+          PROXY_HOST:            ${{ secrets.PROXY_HOST }}
+          PROXY_PORT:            ${{ secrets.PROXY_PORT }}
+          PROXY_USER:            ${{ secrets.PROXY_USER }}
+          PROXY_PASS:            ${{ secrets.PROXY_PASS }}
         run: |
-          python - <<'PYEOF'
-          import os, glob, boto3, sys
-          from botocore.config import Config
-          from datetime import datetime
-
-          bucket   = os.environ["S3_BUCKET"]
-          endpoint = os.environ.get("S3_ENDPOINT_URL") or None
-          region   = os.environ.get("AWS_REGION", "auto")
-
-          s3 = boto3.client(
-              "s3",
-              endpoint_url=endpoint,
-              aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-              aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-              region_name=region,
-              config=Config(signature_version="s3v4"),
-          )
-
-          run_ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-          files  = glob.glob("data/raw/lazada/**/*.parquet", recursive=True)
-          keys   = []
-          for f in files:
-              key = f"raw/lazada/{run_ts}/{os.path.basename(f)}"
-              print(f"Uploading {f} → s3://{bucket}/{key}")
-              s3.upload_file(f, bucket, key)
-              keys.append(key)
-
-          if not files:
-              print("WARNING: No parquet files found to upload.")
-              sys.exit(0)
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
-              fh.write(f"parquet_key=raw/lazada/{run_ts}/\n")
-          PYEOF
+          python src/ingestion/scrapers/lazada_scraper.py
+          COUNT=$(python -c "
+          import glob, pyarrow.parquet as pq
+          files = glob.glob('data/raw/lazada/*.parquet')
+          print(sum(pq.read_table(f).num_rows for f in files) if files else 0)
+          " 2>/dev/null || echo 0)
+          echo "rows_scraped=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Lazada rows scraped: $COUNT"
 
       - name: Upload artifact (S3 fallback)
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: lazada-raw-parquet-${{ github.run_number }}
+          name: lazada-parquet-${{ github.run_number }}
           path: data/raw/lazada/
           retention-days: 1
+          if-no-files-found: warn
 
-  # ── 3. PySpark Processing ────────────────────────────────────────────────────
+  # ── 4. Spark Processing ──────────────────────────────────────────────────────
   spark-processing:
-    name: Spark Processing + Gemini NLP
-    # Only run after BOTH scrapers AND only on schedule/push-to-main/dispatch
+    name: Spark + Gemini NLP (incremental mode)
     needs: [scrape-shopee, scrape-lazada]
+    # Run if at least ONE scraper succeeded
     if: >
       always() &&
-      (needs.scrape-shopee.result == 'success' || needs.scrape-shopee.result == 'skipped') &&
-      (needs.scrape-lazada.result == 'success' || needs.scrape-lazada.result == 'skipped') &&
+      (needs.scrape-shopee.result == 'success' || needs.scrape-lazada.result == 'success') &&
       (
         github.event_name == 'schedule' ||
         (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
         (github.event_name == 'workflow_dispatch' && github.event.inputs.run_full_pipeline == 'true')
       )
     runs-on: ubuntu-latest
+    timeout-minutes: 35
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ── Java 17 for Spark ──────────────────────────────────────────────────
-      - name: Set up Java 17 (Temurin)
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      - name: Install Python + Spark dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          # PySpark + Delta Lake (must match spark_pipeline.py JAR versions)
-          pip install pyspark==3.5.1 delta-spark==3.1.0
-
-      # ── Spark Maven JAR cache ──────────────────────────────────────────────
       - name: Cache Spark Maven JARs
         uses: actions/cache@v4
         with:
@@ -357,29 +234,38 @@ jobs:
           key: spark-jars-${{ hashFiles('src/processing/spark_pipeline.py') }}
           restore-keys: spark-jars-
 
-      - name: Run PySpark pipeline
+      - name: Install Spark deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            pyspark==3.5.1 \
+            delta-spark==3.1.0 \
+            pyarrow==15.0.0 \
+            boto3==1.34.0 \
+            botocore==1.34.0 \
+            psycopg2-binary==2.9.9 \
+            loguru==0.7.2 \
+            google-genai==0.8.0
+
+      - name: Run PySpark pipeline (incremental)
         env:
-          # Storage
+          SPARK_MODE:            "incremental"
+          SPARK_DRIVER_MEMORY:   "4g"
+          SPARK_EXECUTOR_MEMORY: "2g"
           AWS_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           S3_BUCKET:             ${{ secrets.S3_BUCKET }}
           S3_ENDPOINT_URL:       ${{ secrets.S3_ENDPOINT_URL }}
           AWS_REGION:            ${{ secrets.AWS_REGION }}
-          # Database
-          POSTGRES_HOST:     ${{ secrets.POSTGRES_HOST }}
-          POSTGRES_PORT:     ${{ secrets.POSTGRES_PORT }}
-          POSTGRES_USER:     ${{ secrets.POSTGRES_USER }}
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
-          POSTGRES_DB:       ${{ secrets.POSTGRES_DB }}
-          # Gemini NLP
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          # Spark memory — GHA runner has 7 GB RAM total
-          SPARK_DRIVER_MEMORY:   "4g"
-          SPARK_EXECUTOR_MEMORY: "2g"
-        run: |
-          python src/processing/spark_pipeline.py
+          POSTGRES_HOST:         ${{ secrets.POSTGRES_HOST }}
+          POSTGRES_PORT:         ${{ secrets.POSTGRES_PORT }}
+          POSTGRES_USER:         ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD:     ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB:           ${{ secrets.POSTGRES_DB }}
+          GEMINI_API_KEY:        ${{ secrets.GEMINI_API_KEY }}
+        run: python src/processing/spark_pipeline.py
 
-  # ── 4. dbt Transformations ───────────────────────────────────────────────────
+  # ── 5. dbt Transform ─────────────────────────────────────────────────────────
   dbt-transform:
     name: dbt Run & Test
     needs: spark-processing
@@ -391,21 +277,20 @@ jobs:
         (github.event_name == 'workflow_dispatch' && github.event.inputs.run_full_pipeline == 'true')
       )
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      - name: Install dbt-postgres
+      - name: Install dbt
         run: |
           python -m pip install --upgrade pip
-          pip install dbt-postgres==1.8.0
+          pip install dbt-postgres==1.8.0 dbt-core==1.8.0
 
       - name: dbt deps
         working-directory: dbt
@@ -419,7 +304,6 @@ jobs:
           POSTGRES_USER:     ${{ secrets.POSTGRES_USER }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           POSTGRES_DB:       ${{ secrets.POSTGRES_DB }}
-          DBT_PROFILES_DIR:  "."
         run: dbt run --profiles-dir .
 
       - name: dbt test
@@ -430,7 +314,6 @@ jobs:
           POSTGRES_USER:     ${{ secrets.POSTGRES_USER }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           POSTGRES_DB:       ${{ secrets.POSTGRES_DB }}
-          DBT_PROFILES_DIR:  "."
         run: dbt test --profiles-dir .
 
       - name: Upload dbt artifacts
@@ -441,150 +324,147 @@ jobs:
           path: dbt/target/
           retention-days: 7
 
-  # ── 5. Deploy FastAPI ────────────────────────────────────────────────────────
+  # ── 6. Deploy FastAPI ────────────────────────────────────────────────────────
   deploy-api:
-    name: Deploy FastAPI to Railway
+    name: Deploy FastAPI → Railway
     needs: dbt-transform
     if: >
       needs.dbt-transform.result == 'success' &&
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Install Railway CLI
-        run: |
-          npm install -g @railway/cli@latest
+        run: npm install -g @railway/cli@latest
 
-      - name: Deploy FastAPI service to Railway
+      - name: Deploy to Railway
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
         run: |
-          railway up \
-            --service fastapi-control-center \
-            --detach \
-            --ci
+          railway up --service fastapi-api --detach --ci
 
-  # ── 6. Notification ──────────────────────────────────────────────────────────
-  notify:
-    name: Notify on Result
-    # Always run after the last real job (regardless of success/failure)
-    needs: [lint-and-test, scrape-shopee, scrape-lazada, spark-processing, dbt-transform, deploy-api]
-    if: always()
+  # ── 7. Deploy Frontend → GitHub Pages ────────────────────────────────────────
+  deploy-frontend:
+    name: Deploy Dashboard → GitHub Pages
+    needs: [scrape-shopee, scrape-lazada]
+    if: >
+      always() &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write   # needed to push to gh-pages branch
 
     steps:
-      - name: Evaluate pipeline result
+      - uses: actions/checkout@v4
+
+      - name: Inject Railway API URL into frontend
+        env:
+          FASTAPI_URL: ${{ secrets.FASTAPI_URL }}
+        run: |
+          if [ -n "$FASTAPI_URL" ]; then
+            sed -i "s|https://YOUR-FASTAPI-SERVICE.up.railway.app|$FASTAPI_URL|g" \
+              frontend/index.html
+            echo "API URL injected: $FASTAPI_URL"
+          fi
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir:  ./frontend
+          publish_branch: gh-pages
+          commit_message: "Deploy dashboard [skip ci]"
+
+  # ── 7. Notify ────────────────────────────────────────────────────────────────
+  notify:
+    name: Notify (Slack + Gist)
+    needs: [scrape-shopee, scrape-lazada, spark-processing, dbt-transform]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Evaluate results
         id: result
         run: |
-          # Collect individual job results
-          LINT="${{ needs.lint-and-test.result }}"
           SHOPEE="${{ needs.scrape-shopee.result }}"
           LAZADA="${{ needs.scrape-lazada.result }}"
           SPARK="${{ needs.spark-processing.result }}"
           DBT="${{ needs.dbt-transform.result }}"
-          DEPLOY="${{ needs.deploy-api.result }}"
 
-          # Determine overall status
           FAILED=false
-          for STATUS in "$LINT" "$SHOPEE" "$LAZADA" "$SPARK" "$DBT" "$DEPLOY"; do
-            if [[ "$STATUS" == "failure" || "$STATUS" == "cancelled" ]]; then
-              FAILED=true
-              break
-            fi
+          for S in "$SHOPEE" "$LAZADA" "$SPARK" "$DBT"; do
+            [[ "$S" == "failure" || "$S" == "cancelled" ]] && FAILED=true && break
           done
 
-          if [[ "$FAILED" == "true" ]]; then
-            echo "overall=failure" >> "$GITHUB_OUTPUT"
-          else
-            echo "overall=success" >> "$GITHUB_OUTPUT"
-          fi
+          echo "overall=$([ $FAILED == true ] && echo failure || echo success)" >> "$GITHUB_OUTPUT"
+          echo "shopee_rows=${{ needs.scrape-shopee.outputs.rows_scraped }}" >> "$GITHUB_OUTPUT"
+          echo "lazada_rows=${{ needs.scrape-lazada.outputs.rows_scraped }}" >> "$GITHUB_OUTPUT"
 
-          # Row counts from scraper outputs
-          SHOPEE_ROWS="${{ needs.scrape-shopee.outputs.rows_scraped }}"
-          LAZADA_ROWS="${{ needs.scrape-lazada.outputs.rows_scraped }}"
-          echo "shopee_rows=${SHOPEE_ROWS:-0}" >> "$GITHUB_OUTPUT"
-          echo "lazada_rows=${LAZADA_ROWS:-0}" >> "$GITHUB_OUTPUT"
-
-      # ── Slack failure alert ────────────────────────────────────────────────
       - name: Slack alert on failure
-        if: steps.result.outputs.overall == 'failure' && secrets.SLACK_WEBHOOK_URL != ''
-        uses: slackapi/slack-github-action@v1.26.0
-        with:
-          payload: |
-            {
-              "text": "❌ *Lakehouse Pipeline FAILED* on `${{ github.ref_name }}`",
-              "blocks": [
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": "❌ *Customer Analytics Lakehouse Pipeline Failed*\n\n*Branch:* `${{ github.ref_name }}`\n*Triggered by:* `${{ github.event_name }}`\n*Run:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run #${{ github.run_number }}>\n\n*Job results:*\n• lint-and-test: `${{ needs.lint-and-test.result }}`\n• scrape-shopee: `${{ needs.scrape-shopee.result }}`\n• scrape-lazada: `${{ needs.scrape-lazada.result }}`\n• spark-processing: `${{ needs.spark-processing.result }}`\n• dbt-transform: `${{ needs.dbt-transform.result }}`\n• deploy-api: `${{ needs.deploy-api.result }}`"
-                  }
-                }
-              ]
-            }
+        if: steps.result.outputs.overall == 'failure' && env.SLACK_WEBHOOK_URL != ''
         env:
-          SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
-          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          SHOPEE_R="${{ needs.scrape-shopee.result }}"
+          LAZADA_R="${{ needs.scrape-lazada.result }}"
+          SPARK_R="${{ needs.spark-processing.result }}"
+          DBT_R="${{ needs.dbt-transform.result }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
-      # ── Update GitHub Gist status (success) ───────────────────────────────
-      - name: Update pipeline status Gist
-        if: steps.result.outputs.overall == 'success' && secrets.GIST_TOKEN != ''
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"text\": \"❌ Lakehouse Pipeline FAILED on \`${{ github.ref_name }}\`\",
+              \"blocks\": [{
+                \"type\": \"section\",
+                \"text\": {
+                  \"type\": \"mrkdwn\",
+                  \"text\": \"❌ *Lakehouse Pipeline Failed*\n• scrape-shopee: \`$SHOPEE_R\`\n• scrape-lazada: \`$LAZADA_R\`\n• spark-processing: \`$SPARK_R\`\n• dbt-transform: \`$DBT_R\`\n<$RUN_URL|View run #${{ github.run_number }}>\"
+                }
+              }]
+            }"
+
+      - name: Update Gist on success
+        if: steps.result.outputs.overall == 'success' && env.GIST_TOKEN != ''
         env:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID:    ${{ secrets.STATUS_GIST_ID }}
         run: |
-          python - <<'PYEOF'
-          import os, json, urllib.request, urllib.error
-          from datetime import datetime, timezone
+          SHOPEE_ROWS="${{ steps.result.outputs.shopee_rows }}"
+          LAZADA_ROWS="${{ steps.result.outputs.lazada_rows }}"
+          TOTAL=$((${SHOPEE_ROWS:-0} + ${LAZADA_ROWS:-0}))
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-          token   = os.environ["GIST_TOKEN"]
-          gist_id = os.environ.get("GIST_ID", "")
-
-          payload = {
-              "last_run": datetime.now(timezone.utc).isoformat(),
-              "result":   "success",
-              "run_url":  f"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-              "rows_scraped": {
-                  "shopee": int("${{ steps.result.outputs.shopee_rows }}" or 0),
-                  "lazada": int("${{ steps.result.outputs.lazada_rows }}" or 0),
-              },
-              "job_results": {
-                  "lint_and_test":    "${{ needs.lint-and-test.result }}",
-                  "scrape_shopee":    "${{ needs.scrape-shopee.result }}",
-                  "scrape_lazada":    "${{ needs.scrape-lazada.result }}",
-                  "spark_processing": "${{ needs.spark-processing.result }}",
-                  "dbt_transform":    "${{ needs.dbt-transform.result }}",
-                  "deploy_api":       "${{ needs.deploy-api.result }}",
-              },
+          PAYLOAD=$(cat <<EOF
+          {
+            "last_run": "$NOW",
+            "result": "success",
+            "run_url": "$RUN_URL",
+            "rows_scraped": {
+              "shopee": ${SHOPEE_ROWS:-0},
+              "lazada": ${LAZADA_ROWS:-0},
+              "total":  $TOTAL
+            },
+            "job_results": {
+              "scrape_shopee":    "${{ needs.scrape-shopee.result }}",
+              "scrape_lazada":    "${{ needs.scrape-lazada.result }}",
+              "spark_processing": "${{ needs.spark-processing.result }}",
+              "dbt_transform":    "${{ needs.dbt-transform.result }}"
+            }
           }
+          EOF
+          )
 
-          data = json.dumps({
-              "files": {
-                  "pipeline_status.json": {
-                      "content": json.dumps(payload, indent=2)
-                  }
-              }
-          }).encode()
-
-          url    = f"https://api.github.com/gists/{gist_id}"
-          method = "PATCH" if gist_id else "POST"
-          if not gist_id:
-              url = "https://api.github.com/gists"
-
-          req = urllib.request.Request(url, data=data, method=method)
-          req.add_header("Authorization", f"token {token}")
-          req.add_header("Content-Type", "application/json")
-          req.add_header("Accept", "application/vnd.github+json")
-          req.add_header("X-GitHub-Api-Version", "2022-11-28")
-
-          try:
-              with urllib.request.urlopen(req) as resp:
-                  print(f"Gist updated: {resp.status}")
-          except urllib.error.HTTPError as e:
-              print(f"Gist update failed: {e.code} {e.read().decode()}")
-          PYEOF
+          curl -s -X PATCH "https://api.github.com/gists/${GIST_ID}" \
+            -H "Authorization: token $GIST_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -d "{\"files\":{\"pipeline_status.json\":{\"content\":$(echo "$PAYLOAD" | python3 -c \"import json,sys; print(json.dumps(sys.stdin.read()))\" )}}}"

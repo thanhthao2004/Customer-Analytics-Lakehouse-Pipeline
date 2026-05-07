@@ -4,6 +4,9 @@ PySpark processing pipeline — Cloud S3 / Cloudflare R2 edition.
 Environment variables (set as GitHub Secrets):
   S3_BUCKET, S3_ENDPOINT_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
   POSTGRES_HOST/PORT/USER/PASSWORD/DB, GEMINI_API_KEY, SPARK_DRIVER_MEMORY
+  SPARK_MODE: 'incremental' (default) | 'full'
+    incremental — read only today's UTC parquet files (daily run)
+    full        — read all parquet files (backfill / first run)
 """
 
 import os
@@ -34,15 +37,25 @@ POSTGRES_DB   = os.environ.get("POSTGRES_DB", "customer_analytics")
 GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
 DRIVER_MEMORY   = os.environ.get("SPARK_DRIVER_MEMORY", "4g")
 EXECUTOR_MEMORY = os.environ.get("SPARK_EXECUTOR_MEMORY", "2g")
+SPARK_MODE      = os.environ.get("SPARK_MODE", "incremental")  # incremental | full
 
 JDBC_URL    = f"jdbc:postgresql://{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
 JDBC_DRIVER = "org.postgresql.Driver"
 
-# S3 paths
-RAW_SHOPEE_PATH = f"s3a://{S3_BUCKET}/raw/shopee/*/*.parquet"
-RAW_LAZADA_PATH = f"s3a://{S3_BUCKET}/raw/lazada/*/*.parquet"
+# S3 paths — incremental reads today's UTC partition; full reads everything
+TODAY_UTC = datetime.utcnow().strftime("%Y%m%d")
+if SPARK_MODE == "incremental":
+    RAW_SHOPEE_PATH = f"s3a://{S3_BUCKET}/raw/shopee/{TODAY_UTC}/*.parquet"
+    RAW_LAZADA_PATH = f"s3a://{S3_BUCKET}/raw/lazada/{TODAY_UTC}/*.parquet"
+else:
+    RAW_SHOPEE_PATH = f"s3a://{S3_BUCKET}/raw/shopee/*/*.parquet"
+    RAW_LAZADA_PATH = f"s3a://{S3_BUCKET}/raw/lazada/*/*.parquet"
+
 DELTA_OUT_PATH  = f"s3a://{S3_BUCKET}/processed_delta"
 QUARANTINE_PATH = f"s3a://{S3_BUCKET}/quarantine_reviews"
+
+# JDBC write mode: append for incremental (accumulate), overwrite for full backfill
+JDBC_WRITE_MODE = "append" if SPARK_MODE == "incremental" else "overwrite"
 
 # Gemini settings
 GEMINI_MODEL        = "gemini-2.0-flash"
@@ -252,49 +265,46 @@ def write_processed(df: DataFrame) -> str:
     return DELTA_OUT_PATH
 
 
-def load_to_postgres(df: DataFrame) -> None:
-    logger.info(f"JDBC load → {POSTGRES_HOST}/{POSTGRES_DB} :: staging.reviews")
-    (
-        df.write.format("jdbc")
-        .option("url", JDBC_URL)
-        .option("dbtable", "staging.reviews")
-        .option("user", POSTGRES_USER)
-        .option("password", POSTGRES_PASS)
-        .option("driver", JDBC_DRIVER)
-        .option("batchsize", 1000)
-        .mode("append")
-        .save()
-    )
-    logger.success("PostgreSQL load complete.")
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-def run_pipeline():
-    logger.add(sys.stdout, level="INFO", colorize=False)
-    logger.info("=" * 60)
-    logger.info("Customer Analytics Spark Pipeline — Cloud S3 Mode")
-    logger.info(f"  Bucket   : {S3_BUCKET}")
-    logger.info(f"  Endpoint : {S3_ENDPOINT or 'AWS default'}")
-    logger.info(f"  Postgres : {POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}")
-    logger.info("=" * 60)
-
-    spark = create_spark_session()
-    spark.sparkContext.setLogLevel("WARN")
-
-    raw_df       = read_raw(spark)
-    cleaned_df   = clean_and_enrich(raw_df)
-    validated_df = check_data_quality(cleaned_df)
-    logger.info(f"Clean rows after QC: {validated_df.count()}")
-
-    labeled_df = label_sentiment_with_gemini(validated_df)
-    write_processed(labeled_df)
-    load_to_postgres(labeled_df)
-
-    spark.stop()
-    logger.success("Pipeline complete ✓")
-
-
-if __name__ == "__main__":
-    run_pipeline()
+def _dedup_against_existing(df: DataFrame, spark: SparkSession) -> DataFrame:
+    """
+    Anti-join incoming rows against already-loaded staging.reviews.
+    Generates review_key = MD5(platform || item_id::text || reviewer_name || review_time::text)
+    matching the surrogate key used by dbt models.
+    Only new rows (not in staging) are returned.
+    """
+    logger.info("Deduplicating against existing staging.reviews...")
+    try:
+        existing_keys_df = (
+            spark.read.format("jdbc")
+            .option("url", JDBC_URL)
+            .option(
+                "query",
+                "SELECT DISTINCT MD5(platform || item_id::text || reviewer_name "
+                "|| review_time::text) AS review_key FROM staging.reviews",
+            )
+            .option("user", POSTGRES_USER)
+            .option("password", POSTGRES_PASS)
+            .option("driver", JDBC_DRIVER)
+            .load()
+        )
+        incoming = df.withColumn(
+            "_review_key",
+            F.md5(
+                F.concat_ws("",
+                    F.col("platform"),
+                    F.col("item_id").cast("string"),
+                    F.col("reviewer_name"),
+                    F.col("review_time").cast("string"),
+                )
+            ),
+        )
+        deduped = (
+            incoming
+            .join(
+                existing_keys_df.withColumnRenamed("review_key", "_existing_key"),
+                incoming["_review_key"] == F.col("_existing_key"),
+                how="left_anti",
+            )
+            .drop("_review_key")
+        )
+      
