@@ -18,7 +18,7 @@ import requests
 import pyarrow as pa
 import pyarrow.parquet as pq
 from loguru import logger
-import undetected_chtromedriver as uc
+import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
