@@ -105,8 +105,10 @@ def get_session_cookies():
         options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--window-size=1920,1080")
 
-    driver = uc.Chrome(options=options)
+    # use_subprocess=True is critical for GHA to prevent process hanging
+    driver = uc.Chrome(options=options, use_subprocess=True)
     try:
         driver.get("https://shopee.vn/buyer/login")
         time.sleep(3)

@@ -82,8 +82,11 @@ def get_lazada_cookies():
     if IS_CI:
         options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--window-size=1920,1080")
     
-    driver = uc.Chrome(options=options)
+    # use_subprocess=True prevents hangs in GHA
+    driver = uc.Chrome(options=options, use_subprocess=True)
     try:
         driver.get("https://member.lazada.vn/user/login")
         time.sleep(3)
